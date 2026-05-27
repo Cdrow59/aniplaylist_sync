@@ -220,5 +220,5 @@ __marimo__/
 .streamlit/secrets.toml
 
 #Sqlite
-.sqlite3
-.sqlite
+*.sqlite3
+*.sqlite
