@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections import deque
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
@@ -87,7 +89,16 @@ def _series_name_for_component(
     known_titles: list[tuple[int, str]] = []
 
     for anime_id in sorted(set(member_ids)):
-        title = _clean_title(details_by_id.get(anime_id, {}).get("title"))
+        details = details_by_id.get(anime_id, {}) or {}
+
+        # Prefer English alternative title when available
+        alt = details.get("alternative_titles")
+        en_title = None
+        if isinstance(alt, dict):
+            en_title = _clean_title(alt.get("en"))
+
+        # Fallback to the primary title
+        title = en_title or _clean_title(details.get("title"))
         if title:
             known_titles.append((anime_id, title))
 
@@ -101,7 +112,10 @@ def _series_name_for_component(
 
 
 async def discover_series(
-    client: MALClient, seed_ids: Iterable[int]
+    client: MALClient,
+    seed_ids: Iterable[int],
+    *,
+    progress: Progress | None = None,
 ) -> SeriesDiscoveryResult:
     queue = deque(int(anime_id) for anime_id in seed_ids)
     if not queue:
@@ -112,13 +126,22 @@ async def discover_series(
     graph = nx.Graph()
     details_by_id: dict[int, dict[str, Any]] = {}
 
-    with Progress(
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(),
-        MofNCompleteColumn(),
-        TimeElapsedColumn(),
-        TimeRemainingColumn(),
-    ) as progress:
+    progress_context = (
+        Progress(
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            MofNCompleteColumn(),
+            TimeElapsedColumn(),
+            TimeRemainingColumn(),
+            transient=True,
+        )
+        if progress is None
+        else nullcontext(progress)
+    )
+
+    with progress_context as progress:
+        assert progress is not None
+
         task_id = progress.add_task("Series", total=len(queue))
         total = len(queue)
 

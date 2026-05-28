@@ -9,10 +9,10 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-from dataclasses import asdict
+from contextlib import nullcontext
 from pathlib import Path
-from typing import Iterable
 
+from playwright.async_api import Error as PlaywrightError
 from rich.progress import (
     BarColumn,
     MofNCompleteColumn,
@@ -117,13 +117,17 @@ def normalize_status(value: str) -> str:
 
 
 async def run_series_stage(
-    db_path: Path, client: MALClient, mal_entries: list[MALAnimeEntry]
+    db_path: Path,
+    client: MALClient,
+    mal_entries: list[MALAnimeEntry],
+    *,
+    progress: Progress | None = None,
 ) -> None:
     seed_ids = [entry.mal_id for entry in mal_entries]
     if not seed_ids:
         return
 
-    discovery = await discover_series(client, seed_ids)
+    discovery = await discover_series(client, seed_ids, progress=progress)
     await save_series_clusters(db_path, discovery.clusters)
 
 
@@ -135,16 +139,26 @@ async def run_aniplaylist_stage(
     exact_filter: bool,
     aniplaylist_delay: float,
     emit_json: bool,
+    progress: Progress | None = None,
 ) -> list[dict[str, object]]:
     summary: list[dict[str, object]] = []
 
-    with Progress(
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(),
-        MofNCompleteColumn(),
-        TimeElapsedColumn(),
-        TimeRemainingColumn(),
-    ) as progress:
+    progress_context = (
+        Progress(
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            MofNCompleteColumn(),
+            TimeElapsedColumn(),
+            TimeRemainingColumn(),
+            transient=True,
+        )
+        if progress is None
+        else nullcontext(progress)
+    )
+
+    with progress_context as progress:
+        assert progress is not None
+
         task_id = progress.add_task("AniPlaylist", total=len(mal_entries))
 
         for entry in mal_entries:
@@ -161,7 +175,7 @@ async def run_aniplaylist_stage(
                         headless=not headed,
                         exact_titles=exact_titles,
                     )
-                except Exception as exc:
+                except (PlaywrightError, RuntimeError, ValueError, OSError) as exc:
                     await save_failure(
                         db_path,
                         title_query,
@@ -246,52 +260,58 @@ async def run(args) -> None:
     )
 
     try:
-        mal_entries = await client.list_user_anime(status=mal_status)
-
-        if args.limit and args.limit > 0:
-            mal_entries = mal_entries[: args.limit]
-
-        if not mal_entries:
-            print("No MAL anime entries found.")
-            return
-
-        series_task = asyncio.create_task(
-            run_series_stage(args.db, client, mal_entries)
-        )
-        aniplaylist_task = asyncio.create_task(
-            run_aniplaylist_stage(
-                args.db,
-                mal_entries,
-                headed=args.headed,
-                exact_filter=not args.no_exact_filter,
-                aniplaylist_delay=aniplaylist_delay,
-                emit_json=args.json,
+        summary: list[dict[str, object]] = []
+        with Progress(
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            MofNCompleteColumn(),
+            TimeElapsedColumn(),
+            TimeRemainingColumn(),
+        ) as progress:
+            mal_entries = await client.list_user_anime(
+                status=mal_status,
+                progress=progress,
             )
-        )
 
-        summary, _ = await asyncio.gather(aniplaylist_task, series_task)
+            if args.limit and args.limit > 0:
+                mal_entries = mal_entries[: args.limit]
+
+            if not mal_entries:
+                print("No MAL anime entries found.")
+                return
+
+            series_task = asyncio.create_task(
+                run_series_stage(
+                    args.db,
+                    client,
+                    mal_entries,
+                    progress=progress,
+                )
+            )
+            aniplaylist_task = asyncio.create_task(
+                run_aniplaylist_stage(
+                    args.db,
+                    mal_entries,
+                    headed=args.headed,
+                    exact_filter=not args.no_exact_filter,
+                    aniplaylist_delay=aniplaylist_delay,
+                    emit_json=args.json,
+                    progress=progress,
+                )
+            )
+
+            summary, _ = await asyncio.gather(aniplaylist_task, series_task)
+
+            if not args.dry_run:
+                from spotify import run_spotify_stage
+
+                await run_spotify_stage(
+                    args.db,
+                    megaplaylist=bool(args.megaplaylist),
+                    progress=progress,
+                )
     finally:
         await client.close()
 
     if args.json:
         print(json.dumps(summary, ensure_ascii=False, indent=2))
-
-
-if __name__ == "__main__":
-    # allow running the orchestrator directly for debugging
-    import argparse
-
-    parser = argparse.ArgumentParser()
-    # mimic the CLI arguments so this module can be run directly
-    parser.add_argument("--db", type=Path, default=DEFAULT_DB_PATH)
-    parser.add_argument("--username", default=None)
-    parser.add_argument("--client-id", default=None)
-    parser.add_argument("--access-token", default=None)
-    parser.add_argument("--limit", type=int, default=0)
-    parser.add_argument("--no-exact-filter", action="store_true")
-    parser.add_argument("--json", action="store_true")
-    parser.add_argument("--headed", action="store_true")
-    parser.add_argument("--aniplaylist-delay", type=float, default=None)
-    parser.add_argument("--status", default=None)
-    args = parser.parse_args()
-    asyncio.run(run(args))
