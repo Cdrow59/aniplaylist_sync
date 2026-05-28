@@ -1,44 +1,33 @@
-"""Batch MAL -> AniPlaylist linker.
+"""Main orchestration and stages for MAL -> AniPlaylist sync.
 
-This script pulls a user's MAL anime list, uses each anime title as an AniPlaylist
-search query, and stores the query/results in SQLite.
+This module contains the core logic and helper functions. `cli.py` is a
+thin entrypoint that parses arguments and calls `run(args)` below.
 """
 
 from __future__ import annotations
 
-import argparse
 import asyncio
 import json
 import os
+from dataclasses import asdict
 from pathlib import Path
 from typing import Iterable
 
-from dotenv import load_dotenv
 from rich.progress import (
     BarColumn,
     MofNCompleteColumn,
     Progress,
-    SpinnerColumn,
     TextColumn,
     TimeElapsedColumn,
     TimeRemainingColumn,
 )
 
-from aniplaylist_bot import (
-    DB_PATH,
-    SearchResult,
-    init_db,
-    save_failure,
-    save_run,
-    search_aniplaylist,
-)
-from mal import MALClient
-from series_discovery import discover_series, save_series_clusters
-
-load_dotenv(dotenv_path=Path(__file__).with_name(".env"), override=False)
+from aniplaylist import SearchResult, search_aniplaylist
+from db import DB_PATH, init_db, save_failure, save_run
+from mal import MALAnimeEntry, MALClient
+from series import discover_series, save_series_clusters
 
 DEFAULT_DB_PATH = DB_PATH
-DEFAULT_CONCURRENCY = 1
 MAL_STATUS_ALIASES = {
     "complete": "completed",
     "completed": "completed",
@@ -56,20 +45,7 @@ def read_env(name: str, fallback: str | None = None) -> str:
     return value.strip()
 
 
-def chunked(items: Iterable[tuple[int, str]], size: int) -> list[list[tuple[int, str]]]:
-    batch: list[tuple[int, str]] = []
-    batches: list[list[tuple[int, str]]] = []
-    for item in items:
-        batch.append(item)
-        if len(batch) >= size:
-            batches.append(batch)
-            batch = []
-    if batch:
-        batches.append(batch)
-    return batches
-
-
-def candidate_titles(entry) -> list[str]:
+def candidate_titles(entry: MALAnimeEntry) -> list[str]:
     candidates: list[str] = []
 
     def add_candidate(value: object | None) -> None:
@@ -78,11 +54,11 @@ def candidate_titles(entry) -> list[str]:
             if cleaned and cleaned not in candidates:
                 candidates.append(cleaned)
 
-    alternative_titles = getattr(entry, "alternative_titles", None) or {}
+    alternative_titles = entry.alternative_titles or {}
     if isinstance(alternative_titles, dict):
         add_candidate(alternative_titles.get("en"))
 
-    add_candidate(getattr(entry, "title", None))
+    add_candidate(entry.title)
 
     if isinstance(alternative_titles, dict):
         add_candidate(alternative_titles.get("ja"))
@@ -90,7 +66,7 @@ def candidate_titles(entry) -> list[str]:
     return candidates
 
 
-def exact_title_candidates(entry) -> list[str]:
+def exact_title_candidates(entry: MALAnimeEntry) -> list[str]:
     titles: list[str] = []
 
     def add_candidate(value: object | None) -> None:
@@ -99,11 +75,11 @@ def exact_title_candidates(entry) -> list[str]:
             if cleaned and cleaned not in titles:
                 titles.append(cleaned)
 
-    alternative_titles = getattr(entry, "alternative_titles", None) or {}
+    alternative_titles = entry.alternative_titles or {}
     if isinstance(alternative_titles, dict):
         add_candidate(alternative_titles.get("en"))
 
-    add_candidate(getattr(entry, "title", None))
+    add_candidate(entry.title)
 
     if isinstance(alternative_titles, dict):
         add_candidate(alternative_titles.get("ja"))
@@ -111,9 +87,9 @@ def exact_title_candidates(entry) -> list[str]:
     return titles
 
 
-def title_metadata(entry) -> tuple[str | None, str | None, str | None]:
-    native_title = getattr(entry, "title", None)
-    alternative_titles = getattr(entry, "alternative_titles", None) or {}
+def title_metadata(entry: MALAnimeEntry) -> tuple[str | None, str | None, str | None]:
+    native_title = entry.title or None
+    alternative_titles = entry.alternative_titles or {}
 
     english_title = None
     japanese_title = None
@@ -131,17 +107,6 @@ def title_metadata(entry) -> tuple[str | None, str | None, str | None]:
     return clean(native_title), clean(english_title), clean(japanese_title)
 
 
-async def process_title(
-    db_path: Path, query: str, exact_only: bool
-) -> list[SearchResult]:
-    results = await search_aniplaylist(query)
-    if exact_only:
-        filtered = [result for result in results if result.matched_query]
-        results = filtered or results
-    await save_run(db_path, query, results)
-    return results
-
-
 def normalize_status(value: str) -> str:
     normalized = value.strip().lower().replace("-", "_")
     if normalized not in MAL_STATUS_ALIASES:
@@ -152,7 +117,7 @@ def normalize_status(value: str) -> str:
 
 
 async def run_series_stage(
-    db_path: Path, client: MALClient, mal_entries: list[object]
+    db_path: Path, client: MALClient, mal_entries: list[MALAnimeEntry]
 ) -> None:
     seed_ids = [entry.mal_id for entry in mal_entries]
     if not seed_ids:
@@ -164,7 +129,7 @@ async def run_series_stage(
 
 async def run_aniplaylist_stage(
     db_path: Path,
-    mal_entries: list[object],
+    mal_entries: list[MALAnimeEntry],
     *,
     headed: bool,
     exact_filter: bool,
@@ -180,7 +145,7 @@ async def run_aniplaylist_stage(
         TimeElapsedColumn(),
         TimeRemainingColumn(),
     ) as progress:
-        task = progress.add_task("AniPlaylist", total=len(mal_entries))
+        task_id = progress.add_task("AniPlaylist", total=len(mal_entries))
 
         for entry in mal_entries:
             titles_to_try = candidate_titles(entry)
@@ -251,7 +216,7 @@ async def run_aniplaylist_stage(
             if aniplaylist_delay > 0:
                 await asyncio.sleep(aniplaylist_delay)
 
-            progress.advance(task)
+            progress.advance(task_id)
 
     if emit_json:
         return summary
@@ -259,46 +224,7 @@ async def run_aniplaylist_stage(
     return summary
 
 
-async def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Fetch a MAL user's anime titles and search each one on AniPlaylist."
-    )
-    parser.add_argument(
-        "--db", type=Path, default=DEFAULT_DB_PATH, help="SQLite database path"
-    )
-    parser.add_argument("--username", default=None, help="MAL username or @me")
-    parser.add_argument("--client-id", default=None, help="MAL client ID")
-    parser.add_argument("--access-token", default=None, help="MAL access token")
-    parser.add_argument(
-        "--limit",
-        type=int,
-        default=0,
-        help="Optional max number of MAL entries to process",
-    )
-    parser.add_argument(
-        "--no-exact-filter",
-        action="store_true",
-        help="Keep all AniPlaylist results instead of only exact anime-title matches",
-    )
-    parser.add_argument(
-        "--json", action="store_true", help="Print a JSON summary at the end"
-    )
-    parser.add_argument(
-        "--headed", action="store_true", help="Run Playwright in headed mode"
-    )
-    parser.add_argument(
-        "--aniplaylist-delay",
-        type=float,
-        default=None,
-        help="Seconds to wait between AniPlaylist searches",
-    )
-    parser.add_argument(
-        "--status",
-        default=None,
-        help="Filter MAL anime by status (complete, watching, on_hold, dropped, plan_to_watch)",
-    )
-    args = parser.parse_args()
-
+async def run(args) -> None:
     client_id = args.client_id or read_env("MAL_CLIENT_ID")
     access_token = args.access_token or os.getenv("MAL_ACCESS_TOKEN")
     username = args.username or read_env("MAL_USERNAME", "@me")
@@ -349,8 +275,23 @@ async def main() -> None:
 
     if args.json:
         print(json.dumps(summary, ensure_ascii=False, indent=2))
-        return
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    # allow running the orchestrator directly for debugging
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    # mimic the CLI arguments so this module can be run directly
+    parser.add_argument("--db", type=Path, default=DEFAULT_DB_PATH)
+    parser.add_argument("--username", default=None)
+    parser.add_argument("--client-id", default=None)
+    parser.add_argument("--access-token", default=None)
+    parser.add_argument("--limit", type=int, default=0)
+    parser.add_argument("--no-exact-filter", action="store_true")
+    parser.add_argument("--json", action="store_true")
+    parser.add_argument("--headed", action="store_true")
+    parser.add_argument("--aniplaylist-delay", type=float, default=None)
+    parser.add_argument("--status", default=None)
+    args = parser.parse_args()
+    asyncio.run(run(args))

@@ -1,3 +1,5 @@
+"""MAL series discovery helpers."""
+
 from __future__ import annotations
 
 import json
@@ -6,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
 
+import aiohttp
 import aiosqlite
 import networkx as nx
 from rich.progress import (
@@ -101,6 +104,9 @@ async def discover_series(
     client: MALClient, seed_ids: Iterable[int]
 ) -> SeriesDiscoveryResult:
     queue = deque(int(anime_id) for anime_id in seed_ids)
+    if not queue:
+        return SeriesDiscoveryResult(graph=nx.Graph(), clusters=[], details_by_id={})
+
     visited_ids: set[int] = set()
     queued_ids: set[int] = set(queue)
     graph = nx.Graph()
@@ -113,7 +119,8 @@ async def discover_series(
         TimeElapsedColumn(),
         TimeRemainingColumn(),
     ) as progress:
-        task = progress.add_task("Series", total=len(queue))
+        task_id = progress.add_task("Series", total=len(queue))
+        total = len(queue)
 
         while queue:
             current_id = queue.popleft()
@@ -125,12 +132,17 @@ async def discover_series(
 
             try:
                 details = await client.get_anime_details(current_id)
-            except Exception:
-                progress.advance(task)
+            except (
+                aiohttp.ClientError,
+                asyncio.TimeoutError,
+                RuntimeError,
+                ValueError,
+            ):
+                progress.advance(task_id)
                 continue
 
             if not isinstance(details, dict):
-                progress.advance(task)
+                progress.advance(task_id)
                 continue
 
             details_by_id[current_id] = details
@@ -140,9 +152,10 @@ async def discover_series(
                 if related_id not in visited_ids and related_id not in queued_ids:
                     queue.append(related_id)
                     queued_ids.add(related_id)
-                    progress.update(task, total=progress.tasks[task].total + 1)
+                    total += 1
+                    progress.update(task_id, total=total)
 
-            progress.advance(task)
+            progress.advance(task_id)
 
     clusters: list[SeriesCluster] = []
     for component in nx.connected_components(graph):
