@@ -10,7 +10,6 @@ from rich.progress import (
     BarColumn,
     MofNCompleteColumn,
     Progress,
-    SpinnerColumn,
     TextColumn,
     TimeElapsedColumn,
     TimeRemainingColumn,
@@ -55,6 +54,7 @@ class MALAnimeEntry:
     mal_id: int
     title: str
     alternative_titles: dict[str, Any] | None = None
+    related_anime: list[dict[str, Any]] | None = None
     status: str | None = None
     score: float | None = None
     num_episodes_watched: int | None = None
@@ -83,6 +83,13 @@ class MALClient:
         if self.access_token:
             headers["Authorization"] = f"Bearer {self.access_token}"
         return headers
+
+    async def get_anime_details(self, anime_id: int) -> dict[str, Any]:
+        url = f"{self.base_url}/anime/{anime_id}"
+        return await self._get_json(
+            url,
+            params={"fields": "title,alternative_titles,related_anime"},
+        )
 
     async def _get_json(
         self,

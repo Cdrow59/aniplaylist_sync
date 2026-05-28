@@ -99,6 +99,16 @@ async def init_db(db_path: Path) -> None:
                 created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             )
             """)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS series (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                series_name TEXT NOT NULL,
+                member_ids_json TEXT NOT NULL,
+                member_count INTEGER NOT NULL,
+                representative_mal_id INTEGER,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            )
+            """)
         cursor = await db.execute("PRAGMA table_info(searches)")
         existing_columns = {row[1] for row in await cursor.fetchall()}
         await cursor.close()

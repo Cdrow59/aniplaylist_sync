@@ -33,6 +33,7 @@ from aniplaylist_bot import (
     search_aniplaylist,
 )
 from mal import MALClient
+from series_discovery import discover_series, save_series_clusters
 
 load_dotenv(dotenv_path=Path(__file__).with_name(".env"), override=False)
 
@@ -150,6 +151,114 @@ def normalize_status(value: str) -> str:
     return MAL_STATUS_ALIASES[normalized]
 
 
+async def run_series_stage(
+    db_path: Path, client: MALClient, mal_entries: list[object]
+) -> None:
+    seed_ids = [entry.mal_id for entry in mal_entries]
+    if not seed_ids:
+        return
+
+    discovery = await discover_series(client, seed_ids)
+    await save_series_clusters(db_path, discovery.clusters)
+
+
+async def run_aniplaylist_stage(
+    db_path: Path,
+    mal_entries: list[object],
+    *,
+    headed: bool,
+    exact_filter: bool,
+    aniplaylist_delay: float,
+    emit_json: bool,
+) -> list[dict[str, object]]:
+    summary: list[dict[str, object]] = []
+
+    with Progress(
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        MofNCompleteColumn(),
+        TimeElapsedColumn(),
+        TimeRemainingColumn(),
+    ) as progress:
+        task = progress.add_task("AniPlaylist", total=len(mal_entries))
+
+        for entry in mal_entries:
+            titles_to_try = candidate_titles(entry)
+            native_title, english_title, japanese_title = title_metadata(entry)
+            exact_titles = exact_title_candidates(entry)
+            results: list[SearchResult] = []
+            used_query = titles_to_try[0] if titles_to_try else entry.title
+
+            for title_query in titles_to_try:
+                try:
+                    results = await search_aniplaylist(
+                        title_query,
+                        headless=not headed,
+                        exact_titles=exact_titles,
+                    )
+                except Exception as exc:
+                    await save_failure(
+                        db_path,
+                        title_query,
+                        reason=str(exc),
+                        mal_id=entry.mal_id,
+                        native_title=native_title,
+                        english_title=english_title,
+                        japanese_title=japanese_title,
+                        status=entry.status,
+                    )
+                    continue
+
+                used_query = title_query
+                if results:
+                    break
+
+            if not exact_filter:
+                filtered = [result for result in results if result.matched_query]
+                results = filtered or results
+
+            if not results:
+                await save_failure(
+                    db_path,
+                    used_query,
+                    reason="No AniPlaylist results matched",
+                    mal_id=entry.mal_id,
+                    native_title=native_title,
+                    english_title=english_title,
+                    japanese_title=japanese_title,
+                    status=entry.status,
+                )
+
+            await save_run(
+                db_path,
+                used_query,
+                results,
+                mal_id=entry.mal_id,
+                native_title=native_title,
+                english_title=english_title,
+                japanese_title=japanese_title,
+            )
+
+            summary.append(
+                {
+                    "mal_title": entry.title,
+                    "used_query": used_query,
+                    "result_count": len(results),
+                    "matched": any(result.matched_query for result in results),
+                }
+            )
+
+            if aniplaylist_delay > 0:
+                await asyncio.sleep(aniplaylist_delay)
+
+            progress.advance(task)
+
+    if emit_json:
+        return summary
+
+    return summary
+
+
 async def main() -> None:
     parser = argparse.ArgumentParser(
         description="Fetch a MAL user's anime titles and search each one on AniPlaylist."
@@ -212,105 +321,35 @@ async def main() -> None:
 
     try:
         mal_entries = await client.list_user_anime(status=mal_status)
+
+        if args.limit and args.limit > 0:
+            mal_entries = mal_entries[: args.limit]
+
+        if not mal_entries:
+            print("No MAL anime entries found.")
+            return
+
+        series_task = asyncio.create_task(
+            run_series_stage(args.db, client, mal_entries)
+        )
+        aniplaylist_task = asyncio.create_task(
+            run_aniplaylist_stage(
+                args.db,
+                mal_entries,
+                headed=args.headed,
+                exact_filter=not args.no_exact_filter,
+                aniplaylist_delay=aniplaylist_delay,
+                emit_json=args.json,
+            )
+        )
+
+        summary, _ = await asyncio.gather(aniplaylist_task, series_task)
     finally:
         await client.close()
-
-    if args.limit and args.limit > 0:
-        mal_entries = mal_entries[: args.limit]
-
-    if not mal_entries:
-        print("No MAL anime entries found.")
-        return
-
-    summary: list[dict[str, object]] = []
-
-    with Progress(
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(),
-        MofNCompleteColumn(),
-        TimeElapsedColumn(),
-        TimeRemainingColumn(),
-    ) as progress:
-        task = progress.add_task("AniPlaylist", total=len(mal_entries))
-
-        for entry in mal_entries:
-            titles_to_try = candidate_titles(entry)
-            native_title, english_title, japanese_title = title_metadata(entry)
-            exact_titles = exact_title_candidates(entry)
-            results: list[SearchResult] = []
-            used_query = titles_to_try[0] if titles_to_try else entry.title
-
-            for title_query in titles_to_try:
-                try:
-                    results = await search_aniplaylist(
-                        title_query,
-                        headless=not args.headed,
-                        exact_titles=exact_titles,
-                    )
-                except Exception as exc:
-                    await save_failure(
-                        args.db,
-                        title_query,
-                        reason=str(exc),
-                        mal_id=entry.mal_id,
-                        native_title=native_title,
-                        english_title=english_title,
-                        japanese_title=japanese_title,
-                        status=entry.status,
-                    )
-                    continue
-
-                used_query = title_query
-                if results:
-                    break
-
-            if not args.no_exact_filter:
-                filtered = [result for result in results if result.matched_query]
-                results = filtered or results
-
-            if not results:
-                await save_failure(
-                    args.db,
-                    used_query,
-                    reason="No AniPlaylist results matched",
-                    mal_id=entry.mal_id,
-                    native_title=native_title,
-                    english_title=english_title,
-                    japanese_title=japanese_title,
-                    status=entry.status,
-                )
-
-            await save_run(
-                args.db,
-                used_query,
-                results,
-                mal_id=entry.mal_id,
-                native_title=native_title,
-                english_title=english_title,
-                japanese_title=japanese_title,
-            )
-
-            summary.append(
-                {
-                    "mal_title": entry.title,
-                    "used_query": used_query,
-                    "result_count": len(results),
-                    "matched": any(result.matched_query for result in results),
-                }
-            )
-
-            if aniplaylist_delay > 0:
-                await asyncio.sleep(aniplaylist_delay)
-
-            progress.advance(task)
 
     if args.json:
         print(json.dumps(summary, ensure_ascii=False, indent=2))
         return
-
-    total_matches = sum(1 for item in summary if item["matched"])
-    print(f"Processed {len(summary)} MAL titles.")
-    print(f"Exact AniPlaylist matches found for {total_matches} titles.")
 
 
 if __name__ == "__main__":
