@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import asyncio
-import aiohttp
 import json
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import Any
 
+import aiohttp
 from rich.progress import (
     BarColumn,
     MofNCompleteColumn,
@@ -109,7 +110,12 @@ class MALClient:
 
         return json.loads(await resp.text())
 
-    async def list_user_anime(self, status: str | None = None) -> list[MALAnimeEntry]:
+    async def list_user_anime(
+        self,
+        status: str | None = None,
+        *,
+        progress: Progress | None = None,
+    ) -> list[MALAnimeEntry]:
         user_path = self.username or "@me"
 
         url = f"{self.base_url}/users/{user_path}/animelist"
@@ -124,13 +130,21 @@ class MALClient:
         entries: list[MALAnimeEntry] = []
         offset = 0
 
-        with Progress(
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            MofNCompleteColumn(),
-            TimeElapsedColumn(),
-            TimeRemainingColumn(),
-        ) as progress:
+        progress_context = (
+            Progress(
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                MofNCompleteColumn(),
+                TimeElapsedColumn(),
+                TimeRemainingColumn(),
+            )
+            if progress is None
+            else nullcontext(progress)
+        )
+
+        with progress_context as progress:
+            assert progress is not None
+
             task = progress.add_task("MAL", total=None)
 
             while True:
