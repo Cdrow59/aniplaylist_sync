@@ -4,10 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import re
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
-from urllib.parse import urljoin
 
 from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from playwright.async_api import async_playwright
@@ -30,6 +30,47 @@ ARTIST_SELECTOR = "span.text-sgreen"
 SPOTIFY_LINK_SELECTOR = r"div.flex-initial.xl\:mt-2 a[aria-label*='Spotify']"
 UNRELEASED_NOTICE_TEXT = "Not yet released on streaming platforms."
 DB_PATH = Path("aniplaylist.sqlite3")
+ADVANCED_INFO_DIALOG_SELECTOR = "div[id^='headlessui-dialog-panel-']"
+ADVANCED_INFO_SYNONYMS_SELECTOR = (
+    "div.mt-4.flex.flex-col-reverse.sm\\:flex-row.w-full > "
+    "div.w-full.md\\:w-2\\/3 > div:nth-child(1) > span"
+)
+
+TITLE_PUNCT_TRANSLATION = str.maketrans(
+    {
+        "‘": "'",
+        "’": "'",
+        "ʼ": "'",
+        "＇": "'",
+        "‛": "'",
+        "“": '"',
+        "”": '"',
+        "„": '"',
+        "‟": '"',
+        "＂": '"',
+        "‐": "-",
+        "‑": "-",
+        "‒": "-",
+        "–": "-",
+        "—": "-",
+        "―": "-",
+        "−": "-",
+        "﹘": "-",
+        "﹣": "-",
+        "－": "-",
+        "～": "~",
+        "〜": "~",
+        "∼": "~",
+        "！": "!",
+        "﹗": "!",
+        "？": "?",
+        "﹖": "?",
+        "：": ":",
+        "；": ";",
+        "，": ",",
+        "．": ".",
+    }
+)
 
 
 @dataclass(slots=True)
@@ -41,17 +82,27 @@ class SearchResult:
     artists: list[str]
     spotify_link: str | None
     matched_query: bool
+    source_index: int | None = None
+    advanced_attempted: bool = False
+    advanced_synonyms: list[str] | None = None
+    advanced_matched_synonym: str | None = None
+    advanced_error: str | None = None
 
 
 def normalize_text(value: str) -> str:
-    return re.sub(r"\s+", " ", value).strip().casefold()
+    text = unicodedata.normalize("NFKC", value)
+    text = re.sub(r"\s+", " ", text).strip().casefold()
+    return text
 
 
-def normalize_anime_query(query: str) -> str:
-    value = normalize_text(query)
-    for character in ("'", '"', "`", "‘", "’", "“", "”"):
-        value = value.replace(character, "")
-    return re.sub(r"[^\w\s;:-]+", "", value)
+def normalize_title_for_match(value: str) -> str:
+    text = unicodedata.normalize("NFKC", value).casefold().strip()
+    text = text.translate(TITLE_PUNCT_TRANSLATION)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+# `normalize_anime_query` removed — use `normalize_title_for_match` or `normalize_text`
+# depending on whether punctuation should be canonicalized or preserved.
 
 
 def parse_song_type(raw_label: str) -> tuple[str, int | None]:
@@ -75,7 +126,9 @@ def unique_non_empty(values: Iterable[str]) -> list[str]:
 
 
 def exact_title_candidates_lower(titles: Iterable[str]) -> set[str]:
-    return {normalize_text(title) for title in titles if title and title.strip()}
+    return {
+        normalize_title_for_match(title) for title in titles if title and title.strip()
+    }
 
 
 async def parse_results(
@@ -84,59 +137,48 @@ async def parse_results(
     exact_titles: Iterable[str] | None = None,
 ) -> list[SearchResult]:
     exact_title_keys = exact_title_candidates_lower(exact_titles or [query])
-    results: list[SearchResult] = []
-
     cards = page.locator(f"{RESULTS_CONTAINER_SELECTOR} {RESULT_CARD_SELECTOR}")
-    card_count = await cards.count()
+    raw_results = await cards.evaluate_all(f"""
+        (elements) => elements.map((card) => {{
+            const textContent = (selector) => {{
+                const element = card.querySelector(selector);
+                return element ? element.textContent.trim() : "";
+            }};
 
-    for index in range(card_count):
-        card = cards.nth(index)
+            const unreleased = Array.from(card.querySelectorAll('p')).some(
+                (element) => element.textContent.trim() === {UNRELEASED_NOTICE_TEXT!r}
+            );
+            const spotifyElement = card.querySelector({SPOTIFY_LINK_SELECTOR!r});
 
-        if await card.locator("p", has_text=UNRELEASED_NOTICE_TEXT).count():
+            return {{
+                unreleased,
+                anime_title: textContent({ANIME_TITLE_SELECTOR!r}),
+                song_type_raw: textContent({SONG_TYPE_SELECTOR!r}),
+                title_raw: textContent({SONG_TITLE_SELECTOR!r}),
+                artist_values: Array.from(card.querySelectorAll({ARTIST_SELECTOR!r})).map(
+                    (element) => element.textContent.trim()
+                ),
+                spotify_link: spotifyElement ? new URL(spotifyElement.getAttribute('href'), document.baseURI).href : null,
+            }};
+        }})
+        """)
+
+    results: list[SearchResult] = []
+    for index, raw_result in enumerate(raw_results):
+        if raw_result["unreleased"]:
             continue
 
-        anime_title = ""
-        song_type = ""
-        sequence: int | None = None
-        title = ""
-        artists: list[str] = []
-        spotify_link: str | None = None
-
-        anime_title_loc = card.locator(ANIME_TITLE_SELECTOR)
-        if await anime_title_loc.count():
-            anime_title = (await anime_title_loc.first.inner_text()).strip()
-
-        song_type_loc = card.locator(SONG_TYPE_SELECTOR)
-        if await song_type_loc.count():
-            song_type, sequence = parse_song_type(
-                (await song_type_loc.first.inner_text()).strip()
-            )
-
-        title_loc = card.locator(SONG_TITLE_SELECTOR)
-        if await title_loc.count():
-            raw_title = (await title_loc.first.inner_text()).strip()
-            title = normalize_text(raw_title)
-
-        artists_container = card.locator(ARTISTS_CONTAINER_SELECTOR)
-        if await artists_container.count():
-            artist_nodes = artists_container.first.locator(ARTIST_SELECTOR)
-            artist_count = await artist_nodes.count()
-            artist_values: list[str] = []
-            for artist_index in range(artist_count):
-                artist_values.append(
-                    (await artist_nodes.nth(artist_index).inner_text()).strip()
-                )
-            artists = unique_non_empty(artist_values)
-
-        spotify_link_loc = card.locator(SPOTIFY_LINK_SELECTOR)
-        if await spotify_link_loc.count():
-            href = await spotify_link_loc.first.get_attribute("href")
-            if href:
-                spotify_link = urljoin(page.url, href)
-
+        anime_title = raw_result["anime_title"]
+        song_type, sequence = parse_song_type(raw_result["song_type_raw"])
+        title = normalize_text(raw_result["title_raw"])
+        artists = unique_non_empty(raw_result["artist_values"])
+        spotify_link = raw_result["spotify_link"]
         matched_query = (
-            normalize_text(anime_title) in exact_title_keys if anime_title else False
+            normalize_title_for_match(anime_title) in exact_title_keys
+            if anime_title
+            else False
         )
+
         results.append(
             SearchResult(
                 anime_title=anime_title,
@@ -146,10 +188,81 @@ async def parse_results(
                 artists=artists,
                 spotify_link=spotify_link,
                 matched_query=matched_query,
+                source_index=index,
             )
         )
 
     return results
+
+
+def split_synonyms(raw_value: str) -> list[str]:
+    return unique_non_empty(
+        part for part in (item.strip() for item in raw_value.split(","))
+    )
+
+
+async def apply_advanced_synonym_matches(
+    page, results: list[SearchResult], exact_titles: Iterable[str]
+) -> None:
+    exact_title_keys = exact_title_candidates_lower(exact_titles)
+    cards = page.locator(f"{RESULTS_CONTAINER_SELECTOR} {RESULT_CARD_SELECTOR}")
+
+    for result in results:
+        if result.matched_query or result.source_index is None:
+            continue
+
+        result.advanced_attempted = True
+        card = cards.nth(result.source_index)
+        advanced_button = card.locator("div.cursor-pointer i").first
+        if not await advanced_button.count():
+            advanced_button = card.locator("div.cursor-pointer").first
+
+        try:
+            await card.hover(timeout=2000)
+        except Exception:
+            pass
+
+        try:
+            await advanced_button.click(force=True, timeout=5000)
+        except Exception as exc:
+            result.advanced_error = str(exc)
+            continue
+
+        dialog = page.locator(ADVANCED_INFO_DIALOG_SELECTOR).first
+        try:
+            await dialog.wait_for(state="visible", timeout=5000)
+            synonyms_locator = dialog.locator(ADVANCED_INFO_SYNONYMS_SELECTOR).first
+            synonyms_text = (await synonyms_locator.text_content() or "").strip()
+        except Exception as exc:
+            result.advanced_error = str(exc)
+            synonyms_text = ""
+        finally:
+            try:
+                await page.keyboard.press("Escape")
+                await page.wait_for_timeout(100)
+            except Exception:
+                pass
+
+        if not synonyms_text:
+            result.advanced_synonyms = []
+            continue
+
+        synonyms = split_synonyms(synonyms_text)
+        result.advanced_synonyms = synonyms
+        if not synonyms:
+            continue
+
+        matched_synonym = next(
+            (
+                synonym
+                for synonym in synonyms
+                if normalize_title_for_match(synonym) in exact_title_keys
+            ),
+            None,
+        )
+        if matched_synonym is not None:
+            result.matched_query = True
+            result.advanced_matched_synonym = matched_synonym
 
 
 async def load_all_result_cards(page, timeout_ms: int = 20000) -> None:
@@ -158,18 +271,12 @@ async def load_all_result_cards(page, timeout_ms: int = 20000) -> None:
     stable_rounds = 0
     deadline = asyncio.get_running_loop().time() + (timeout_ms / 1000)
 
-    while asyncio.get_running_loop().time() < deadline:
-        if previous_count == 0:
-            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            await page.wait_for_timeout(750)
-            current_count = await cards.count()
-            if current_count > 0:
-                previous_count = current_count
-                stable_rounds = 0
-            continue
+    await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+    await page.wait_for_timeout(1000)
 
-        await cards.last.scroll_into_view_if_needed()
-        await page.wait_for_timeout(750)
+    while asyncio.get_running_loop().time() < deadline:
+        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        await page.wait_for_timeout(500)
 
         current_count = await cards.count()
         if current_count == previous_count:
@@ -180,14 +287,15 @@ async def load_all_result_cards(page, timeout_ms: int = 20000) -> None:
             previous_count = current_count
             stable_rounds = 0
 
-    await page.evaluate("window.scrollTo(0, 0)")
-
 
 async def search_aniplaylist(
     query: str,
     headless: bool = True,
     exact_titles: Iterable[str] | None = None,
+    advanced_fallback: bool = False,
 ) -> list[SearchResult]:
+    exact_titles = tuple(exact_titles or (query,))
+
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=headless)
         page = await browser.new_page(viewport={"width": 1200, "height": 1200})
@@ -216,10 +324,19 @@ async def search_aniplaylist(
 
             search_box = page.locator(SEARCH_INPUT_SELECTOR)
             await search_box.wait_for(state="visible", timeout=15000)
-            await search_box.click()
-            if await search_box.is_enabled():
+
+            # Prefer filling the input when enabled; wait briefly for enablement.
+            try:
+                await page.wait_for_function(
+                    "(selector) => { const el = document.querySelector(selector); return !!el && !el.disabled; }",
+                    arg=SEARCH_INPUT_SELECTOR,
+                    timeout=5000,
+                )
                 await search_box.fill(query)
-            else:
+                await search_box.press("Enter")
+            except PlaywrightTimeoutError:
+                # If the input remains disabled (site behavior / race), set the value
+                # directly via DOM and dispatch events so the site reacts as if typed.
                 await page.evaluate(
                     """
                     ({ selector, value }) => {
@@ -228,14 +345,19 @@ async def search_aniplaylist(
                             throw new Error(`Search input not found: ${selector}`);
                         }
                         element.removeAttribute('disabled');
+                        element.focus();
                         element.value = value;
                         element.dispatchEvent(new Event('input', { bubbles: true }));
                         element.dispatchEvent(new Event('change', { bubbles: true }));
+                        element.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+                        element.dispatchEvent(new KeyboardEvent('keypress', { key: 'Enter', bubbles: true }));
+                        element.dispatchEvent(new KeyboardEvent('keyup', { key: 'Enter', bubbles: true }));
                     }
                     """,
                     {"selector": SEARCH_INPUT_SELECTOR, "value": query},
                 )
-            await search_box.press("Enter")
+                # allow site to process the injected events
+                await page.wait_for_timeout(250)
 
             try:
                 await page.wait_for_function(
@@ -268,7 +390,13 @@ async def search_aniplaylist(
                 return await parse_results(page, query, exact_titles=exact_titles)
 
             await load_all_result_cards(page)
-            return await parse_results(page, query, exact_titles=exact_titles)
+            results = await parse_results(page, query, exact_titles=exact_titles)
+
+            if advanced_fallback and exact_titles is not None and results:
+                if not any(result.matched_query for result in results):
+                    await apply_advanced_synonym_matches(page, results, exact_titles)
+
+            return results
         finally:
             if browser.is_connected():
                 try:

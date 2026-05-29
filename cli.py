@@ -25,10 +25,14 @@ def _make_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--client-id", default=None, help="MAL client ID")
     parser.add_argument("--access-token", default=None, help="MAL access token")
     parser.add_argument(
-        "--limit",
-        type=int,
-        default=0,
-        help="Optional max number of MAL entries to process",
+        "--dry-run",
+        action="store_true",
+        help="Does a dry run without interacting with Spotify",
+    )
+    parser.add_argument(
+        "--megaplaylist",
+        action="store_true",
+        help="Put all results into one Spotify playlist instead of one playlist per series",
     )
     parser.add_argument(
         "--no-exact-filter",
@@ -46,6 +50,12 @@ def _make_argparser() -> argparse.ArgumentParser:
         type=float,
         default=None,
         help="Seconds to wait between AniPlaylist searches",
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Limit the number of MAL anime entries processed",
     )
     parser.add_argument(
         "--status",
