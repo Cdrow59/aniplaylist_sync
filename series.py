@@ -93,12 +93,14 @@ def _series_name_for_component(
 
         # Prefer English alternative title when available
         alt = details.get("alternative_titles")
+        native_title = _clean_title(details.get("title"))
         en_title = None
+        jp_title = None
         if isinstance(alt, dict):
             en_title = _clean_title(alt.get("en"))
-
+            jp_title = _clean_title(alt.get("jp"))
         # Fallback to the primary title
-        title = en_title or _clean_title(details.get("title"))
+        title = en_title or native_title or jp_title
         if title:
             known_titles.append((anime_id, title))
 

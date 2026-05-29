@@ -45,23 +45,28 @@ def read_env(name: str, fallback: str | None = None) -> str:
     return value.strip()
 
 
+def _add_title_candidate(target: list[str], value: object | None) -> None:
+    if isinstance(value, str):
+        cleaned = value.strip()
+        if cleaned and cleaned not in target:
+            target.append(cleaned)
+    elif isinstance(value, list):
+        for item in value:
+            _add_title_candidate(target, item)
+
+
 def candidate_titles(entry: MALAnimeEntry) -> list[str]:
     candidates: list[str] = []
 
-    def add_candidate(value: object | None) -> None:
-        if isinstance(value, str):
-            cleaned = value.strip()
-            if cleaned and cleaned not in candidates:
-                candidates.append(cleaned)
-
     alternative_titles = entry.alternative_titles or {}
     if isinstance(alternative_titles, dict):
-        add_candidate(alternative_titles.get("en"))
+        _add_title_candidate(candidates, alternative_titles.get("en"))
 
-    add_candidate(entry.title)
+    _add_title_candidate(candidates, entry.title)
 
     if isinstance(alternative_titles, dict):
-        add_candidate(alternative_titles.get("ja"))
+        _add_title_candidate(candidates, alternative_titles.get("ja"))
+        _add_title_candidate(candidates, alternative_titles.get("synonyms"))
 
     return candidates
 
@@ -69,20 +74,15 @@ def candidate_titles(entry: MALAnimeEntry) -> list[str]:
 def exact_title_candidates(entry: MALAnimeEntry) -> list[str]:
     titles: list[str] = []
 
-    def add_candidate(value: object | None) -> None:
-        if isinstance(value, str):
-            cleaned = value.strip()
-            if cleaned and cleaned not in titles:
-                titles.append(cleaned)
-
     alternative_titles = entry.alternative_titles or {}
     if isinstance(alternative_titles, dict):
-        add_candidate(alternative_titles.get("en"))
+        _add_title_candidate(titles, alternative_titles.get("en"))
 
-    add_candidate(entry.title)
+    _add_title_candidate(titles, entry.title)
 
     if isinstance(alternative_titles, dict):
-        add_candidate(alternative_titles.get("ja"))
+        _add_title_candidate(titles, alternative_titles.get("ja"))
+        _add_title_candidate(titles, alternative_titles.get("synonyms"))
 
     return titles
 
@@ -167,40 +167,124 @@ async def run_aniplaylist_stage(
             exact_titles = exact_title_candidates(entry)
             results: list[SearchResult] = []
             used_query = titles_to_try[0] if titles_to_try else entry.title
+            attempt_logs: list[dict[str, object]] = []
+            last_error_reason: str | None = None
+            search_succeeded = False
 
             for title_query in titles_to_try:
                 try:
-                    results = await search_aniplaylist(
+                    raw_results = await search_aniplaylist(
                         title_query,
                         headless=not headed,
                         exact_titles=exact_titles,
                     )
                 except (PlaywrightError, RuntimeError, ValueError, OSError) as exc:
-                    await save_failure(
-                        db_path,
-                        title_query,
-                        reason=str(exc),
-                        mal_id=entry.mal_id,
-                        native_title=native_title,
-                        english_title=english_title,
-                        japanese_title=japanese_title,
-                        status=entry.status,
+                    last_error_reason = str(exc)
+                    attempt_logs.append(
+                        {
+                            "mode": "simple",
+                            "query": title_query,
+                            "result_count": 0,
+                            "matched_count": 0,
+                            "error": last_error_reason,
+                        }
                     )
                     continue
 
+                search_succeeded = True
                 used_query = title_query
+                matched_results = [
+                    result for result in raw_results if result.matched_query
+                ]
+                attempt_logs.append(
+                    {
+                        "mode": "simple",
+                        "query": title_query,
+                        "result_count": len(raw_results),
+                        "matched_count": len(matched_results),
+                        "error": None,
+                    }
+                )
+
+                if exact_filter:
+                    results = matched_results
+                    if results:
+                        break
+                    continue
+
+                results = raw_results
                 if results:
                     break
 
-            if not exact_filter:
-                filtered = [result for result in results if result.matched_query]
-                results = filtered or results
+            if not results and exact_filter and search_succeeded:
+                progress.console.print(
+                    f"[yellow]Advanced AniPlaylist fallback triggered for {entry.title}.[/yellow]"
+                )
+
+                for title_query in titles_to_try:
+                    try:
+                        raw_results = await search_aniplaylist(
+                            title_query,
+                            headless=not headed,
+                            exact_titles=exact_titles,
+                            advanced_fallback=True,
+                        )
+                    except (PlaywrightError, RuntimeError, ValueError, OSError) as exc:
+                        last_error_reason = str(exc)
+                        attempt_logs.append(
+                            {
+                                "mode": "advanced",
+                                "query": title_query,
+                                "result_count": 0,
+                                "matched_count": 0,
+                                "error": last_error_reason,
+                            }
+                        )
+                        continue
+
+                    search_succeeded = True
+                    used_query = title_query
+                    matched_results = [
+                        result for result in raw_results if result.matched_query
+                    ]
+                    advanced_card_checks = [
+                        {
+                            "source_index": result.source_index,
+                            "anime_title": result.anime_title,
+                            "matched_query": result.matched_query,
+                            "matched_synonym": result.advanced_matched_synonym,
+                            "synonyms": result.advanced_synonyms or [],
+                            "advanced_error": result.advanced_error,
+                        }
+                        for result in raw_results
+                        if result.advanced_attempted
+                    ]
+                    attempt_logs.append(
+                        {
+                            "mode": "advanced",
+                            "query": title_query,
+                            "result_count": len(raw_results),
+                            "matched_count": len(matched_results),
+                            "advanced_card_checks": advanced_card_checks,
+                            "error": None,
+                        }
+                    )
+
+                    results = matched_results if exact_filter else raw_results
+                    if results:
+                        break
 
             if not results:
+                failure_query = json.dumps(attempt_logs, ensure_ascii=False)
+                failure_reason = (
+                    "No AniPlaylist results matched"
+                    if search_succeeded
+                    else (last_error_reason or "AniPlaylist search failed")
+                )
                 await save_failure(
                     db_path,
-                    used_query,
-                    reason="No AniPlaylist results matched",
+                    failure_query,
+                    reason=failure_reason,
                     mal_id=entry.mal_id,
                     native_title=native_title,
                     english_title=english_title,
@@ -277,7 +361,7 @@ async def run(args) -> None:
                 mal_entries = mal_entries[: args.limit]
 
             if not mal_entries:
-                print("No MAL anime entries found.")
+                progress.console.print("[yellow]No MAL anime entries found.[/yellow]")
                 return
 
             series_task = asyncio.create_task(
