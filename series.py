@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
+import unicodedata
 from collections import deque
 from contextlib import nullcontext
 from dataclasses import dataclass
@@ -49,6 +51,21 @@ def _clean_title(value: object | None) -> str | None:
     return None
 
 
+def _normalize_relation_type(value: str | None) -> str | None:
+    if not value:
+        return None
+
+    value = value.strip().casefold()
+
+    if value.startswith("prequel"):
+        return "prequel"
+
+    if value.startswith("sequel"):
+        return "sequel"
+
+    return None
+
+
 def _extract_related_ids(details: dict[str, Any]) -> list[tuple[int, str | None]]:
     related_ids: list[tuple[int, str | None]] = []
     related_anime = details.get("related_anime")
@@ -70,12 +87,13 @@ def _extract_related_ids(details: dict[str, Any]) -> list[tuple[int, str | None]
             continue
 
         relation_type = relation.get("relation_type")
+
         if isinstance(relation_type, str):
-            relation_type = relation_type.strip().casefold() or None
+            relation_type = _normalize_relation_type(relation_type)
         else:
             relation_type = None
 
-        if relation_type not in ALLOWED_SERIES_RELATIONS:
+        if relation_type is None:
             continue
 
         related_ids.append((related_id, relation_type))
@@ -83,34 +101,69 @@ def _extract_related_ids(details: dict[str, Any]) -> list[tuple[int, str | None]
     return related_ids
 
 
+_SERIES_ALIASES = {
+    "Bakemonogatari": "Monogatari",
+    "Fate/stay night": "Fate",
+}
+
+
+_TITLE_CLEANUP_PATTERNS = [
+    r"\(\d{4}\)",  # (2012)
+    r"\b\d+(?:st|nd|rd|th)\s+season\b",
+    r"\bseason\s+\d+\b",
+    r"\bpart\s+\d+\b",
+    r"\bfinal\s+season\b",
+]
+
+
+def _canonical_series_title(title: str) -> str:
+    title = unicodedata.normalize("NFKC", title).strip()
+
+    alias = _SERIES_ALIASES.get(title)
+    if alias:
+        return alias
+
+    for pattern in _TITLE_CLEANUP_PATTERNS:
+        title = re.sub(pattern, "", title, flags=re.IGNORECASE)
+
+    title = re.sub(r"\s+", " ", title)
+
+    return title.strip(" :-")
+
+
 def _series_name_for_component(
-    member_ids: Iterable[int], details_by_id: dict[int, dict[str, Any]]
+    member_ids: Iterable[int],
+    details_by_id: dict[int, dict[str, Any]],
 ) -> tuple[str, int]:
     known_titles: list[tuple[int, str]] = []
 
     for anime_id in sorted(set(member_ids)):
-        details = details_by_id.get(anime_id, {}) or {}
+        details = details_by_id.get(anime_id) or {}
 
-        # Prefer English alternative title when available
-        alt = details.get("alternative_titles")
-        native_title = _clean_title(details.get("title"))
-        en_title = None
-        jp_title = None
-        if isinstance(alt, dict):
-            en_title = _clean_title(alt.get("en"))
-            jp_title = _clean_title(alt.get("jp"))
-        # Fallback to the primary title
-        title = en_title or native_title or jp_title
+        alt = details.get("alternative_titles") or {}
+
+        title = (
+            _clean_title(alt.get("en"))
+            or _clean_title(details.get("title"))
+            or _clean_title(alt.get("jp"))
+        )
+
         if title:
             known_titles.append((anime_id, title))
 
-    if known_titles:
-        representative_id, series_name = min(known_titles, key=lambda item: item[0])
-        return series_name, representative_id
+    if not known_titles:
+        representative_id = min(member_ids)
+        return f"Unknown Series ({representative_id})", representative_id
 
-    member_list = sorted(set(member_ids))
-    representative_id = member_list[0]
-    return f"Series {representative_id}", representative_id
+    representative_id, representative_title = min(
+        known_titles,
+        key=lambda item: item[0],
+    )
+
+    return (
+        _canonical_series_title(representative_title),
+        representative_id,
+    )
 
 
 async def discover_series(
@@ -172,16 +225,41 @@ async def discover_series(
 
             details_by_id[current_id] = details
 
+            # ----------------------------
+            # CORE FIX: BFS expansion only
+            # ----------------------------
             for related_id, relation_type in _extract_related_ids(details):
                 graph.add_edge(current_id, related_id, relation_type=relation_type)
+
                 if related_id not in visited_ids and related_id not in queued_ids:
                     queue.append(related_id)
                     queued_ids.add(related_id)
+                    graph.add_node(related_id)
+
                     total += 1
                     progress.update(task_id, total=total)
 
             progress.advance(task_id)
 
+        progress.update(task_id, total=total + (len(graph.nodes)))
+        for node in graph.nodes:
+            if node in details_by_id:
+                progress.advance(task_id)
+                continue
+
+            try:
+                details = await client.get_anime_details(node)
+                if isinstance(details, dict):
+                    details_by_id[node] = details
+            except (
+                aiohttp.ClientError,
+                asyncio.TimeoutError,
+                RuntimeError,
+                ValueError,
+            ):
+                continue
+            finally:
+                progress.advance(task_id)
     clusters: list[SeriesCluster] = []
     for component in nx.connected_components(graph):
         member_ids = sorted(int(anime_id) for anime_id in component)
@@ -199,6 +277,7 @@ async def discover_series(
     clusters.sort(
         key=lambda cluster: (cluster.series_name.casefold(), cluster.representative_id)
     )
+
     return SeriesDiscoveryResult(
         graph=graph,
         clusters=clusters,
