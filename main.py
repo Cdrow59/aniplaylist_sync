@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 from contextlib import nullcontext
 from pathlib import Path
@@ -22,10 +23,12 @@ from rich.progress import (
     TimeRemainingColumn,
 )
 
-from aniplaylist import SearchResult, search_aniplaylist
+from aniplaylist import SearchResult, close_browser_pool, search_aniplaylist
 from db import DB_PATH, init_db, save_failure, save_run
 from mal import MALAnimeEntry, MALClient
 from series import discover_series, save_series_clusters
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_DB_PATH = DB_PATH
 MAL_STATUS_ALIASES = {
@@ -217,8 +220,8 @@ async def run_aniplaylist_stage(
                     break
 
             if not results and exact_filter and search_succeeded:
-                progress.console.print(
-                    f"[yellow]Advanced AniPlaylist fallback triggered for {entry.title}.[/yellow]"
+                logger.warning(
+                    f"Advanced AniPlaylist fallback triggered for: {entry.mal_id}"
                 )
 
                 for title_query in titles_to_try:
@@ -323,6 +326,38 @@ async def run_aniplaylist_stage(
 
 
 async def run(args) -> None:
+    """Main entry point with timeout protection and resource cleanup.
+
+    Args:
+        args: CLI arguments
+
+    Raises:
+        TimeoutError: If execution exceeds timeout (default: 1800 seconds / 30 minutes)
+    """
+    # Get timeout from args or environment (default 1800s = 30 min)
+    timeout_seconds = getattr(args, "timeout", None) or float(
+        os.getenv("SYNC_TIMEOUT_SECONDS", "1800")
+    )
+
+    logger.info(f"Starting sync with timeout of {timeout_seconds}s")
+
+    try:
+        # Wrap the entire operation in a timeout
+        async with asyncio.timeout(timeout_seconds):
+            await _run_impl(args)
+    except asyncio.TimeoutError:
+        logger.error(f"Sync operation timed out after {timeout_seconds}s")
+        raise
+    finally:
+        # Always ensure browser pool is cleaned up
+        try:
+            await close_browser_pool()
+        except Exception as e:
+            logger.warning(f"Error closing browser pool: {e}")
+
+
+async def _run_impl(args) -> None:
+    """Internal implementation of the sync operation."""
     client_id = args.client_id or read_env("MAL_CLIENT_ID")
     access_token = args.access_token or os.getenv("MAL_ACCESS_TOKEN")
     username = args.username or read_env("MAL_USERNAME", "@me")
@@ -361,7 +396,7 @@ async def run(args) -> None:
                 mal_entries = mal_entries[: args.limit]
 
             if not mal_entries:
-                progress.console.print("[yellow]No MAL anime entries found.[/yellow]")
+                logger.error("No MAL anime entries found!!")
                 return
 
             series_task = asyncio.create_task(
@@ -395,7 +430,10 @@ async def run(args) -> None:
                     progress=progress,
                 )
     finally:
-        await client.close()
+        try:
+            await client.close()
+        except Exception as e:
+            logger.warning(f"Error closing MAL client: {e}")
 
     if args.json:
         print(json.dumps(summary, ensure_ascii=False, indent=2))
