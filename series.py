@@ -7,7 +7,6 @@ import json
 import re
 import unicodedata
 from collections import deque
-from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
@@ -15,14 +14,7 @@ from typing import Any, Iterable
 import aiohttp
 import aiosqlite
 import networkx as nx
-from rich.progress import (
-    BarColumn,
-    MofNCompleteColumn,
-    Progress,
-    TextColumn,
-    TimeElapsedColumn,
-    TimeRemainingColumn,
-)
+from rich.progress import Progress
 
 from mal import MALClient
 
@@ -54,50 +46,37 @@ def _clean_title(value: object | None) -> str | None:
 def _normalize_relation_type(value: str | None) -> str | None:
     if not value:
         return None
-
     value = value.strip().casefold()
-
     if value.startswith("prequel"):
         return "prequel"
-
     if value.startswith("sequel"):
         return "sequel"
-
     return None
 
 
 def _extract_related_ids(details: dict[str, Any]) -> list[tuple[int, str | None]]:
     related_ids: list[tuple[int, str | None]] = []
     related_anime = details.get("related_anime")
-
     if not isinstance(related_anime, list):
         return related_ids
-
     for relation in related_anime:
         if not isinstance(relation, dict):
             continue
-
         node = relation.get("node")
         if not isinstance(node, dict):
             continue
-
         try:
             related_id = int(node.get("id"))
         except (TypeError, ValueError):
             continue
-
         relation_type = relation.get("relation_type")
-
         if isinstance(relation_type, str):
             relation_type = _normalize_relation_type(relation_type)
         else:
             relation_type = None
-
         if relation_type is None:
             continue
-
         related_ids.append((related_id, relation_type))
-
     return related_ids
 
 
@@ -106,9 +85,8 @@ _SERIES_ALIASES = {
     "Fate/stay night": "Fate",
 }
 
-
 _TITLE_CLEANUP_PATTERNS = [
-    r"\(\d{4}\)",  # (2012)
+    r"\(\d{4}\)",
     r"\b\d+(?:st|nd|rd|th)\s+season\b",
     r"\bseason\s+\d+\b",
     r"\bpart\s+\d+\b",
@@ -118,16 +96,12 @@ _TITLE_CLEANUP_PATTERNS = [
 
 def _canonical_series_title(title: str) -> str:
     title = unicodedata.normalize("NFKC", title).strip()
-
     alias = _SERIES_ALIASES.get(title)
     if alias:
         return alias
-
     for pattern in _TITLE_CLEANUP_PATTERNS:
         title = re.sub(pattern, "", title, flags=re.IGNORECASE)
-
     title = re.sub(r"\s+", " ", title)
-
     return title.strip(" :-")
 
 
@@ -136,42 +110,40 @@ def _series_name_for_component(
     details_by_id: dict[int, dict[str, Any]],
 ) -> tuple[str, int]:
     known_titles: list[tuple[int, str]] = []
-
     for anime_id in sorted(set(member_ids)):
         details = details_by_id.get(anime_id) or {}
-
         alt = details.get("alternative_titles") or {}
-
         title = (
             _clean_title(alt.get("en"))
             or _clean_title(details.get("title"))
             or _clean_title(alt.get("jp"))
         )
-
         if title:
             known_titles.append((anime_id, title))
-
     if not known_titles:
         representative_id = min(member_ids)
         return f"Unknown Series ({representative_id})", representative_id
-
     representative_id, representative_title = min(
-        known_titles,
-        key=lambda item: item[0],
+        known_titles, key=lambda item: item[0]
     )
-
-    return (
-        _canonical_series_title(representative_title),
-        representative_id,
-    )
+    return _canonical_series_title(representative_title), representative_id
 
 
 async def discover_series(
     client: MALClient,
     seed_ids: Iterable[int],
     *,
-    progress: Progress | None = None,
+    progress: Progress,
 ) -> SeriesDiscoveryResult:
+    """Discover series clusters via BFS over MAL related-anime edges.
+
+    Args:
+        client: Authenticated MAL client.
+        seed_ids: Starting MAL IDs (typically the user's list).
+        progress: A *started* Rich Progress instance owned by the caller.
+                  Tasks will be added and advanced; the caller retains
+                  ownership and must not stop the Progress here.
+    """
     queue = deque(int(anime_id) for anime_id in seed_ids)
     if not queue:
         return SeriesDiscoveryResult(graph=nx.Graph(), clusters=[], details_by_id={})
@@ -181,85 +153,55 @@ async def discover_series(
     graph = nx.Graph()
     details_by_id: dict[int, dict[str, Any]] = {}
 
-    progress_context = (
-        Progress(
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            MofNCompleteColumn(),
-            TimeElapsedColumn(),
-            TimeRemainingColumn(),
-            transient=True,
-        )
-        if progress is None
-        else nullcontext(progress)
-    )
+    task_id = progress.add_task("Series", total=len(queue))
+    total = len(queue)
 
-    with progress_context as progress:
-        assert progress is not None
+    while queue:
+        current_id = queue.popleft()
+        if current_id in visited_ids:
+            continue
 
-        task_id = progress.add_task("Series", total=len(queue))
-        total = len(queue)
+        visited_ids.add(current_id)
+        graph.add_node(current_id)
 
-        while queue:
-            current_id = queue.popleft()
-            if current_id in visited_ids:
-                continue
+        try:
+            details = await client.get_anime_details(current_id)
+        except (aiohttp.ClientError, asyncio.TimeoutError, RuntimeError, ValueError):
+            progress.advance(task_id)
+            continue
 
-            visited_ids.add(current_id)
-            graph.add_node(current_id)
+        if not isinstance(details, dict):
+            progress.advance(task_id)
+            continue
 
-            try:
-                details = await client.get_anime_details(current_id)
-            except (
-                aiohttp.ClientError,
-                asyncio.TimeoutError,
-                RuntimeError,
-                ValueError,
-            ):
-                progress.advance(task_id)
-                continue
+        details_by_id[current_id] = details
 
-            if not isinstance(details, dict):
-                progress.advance(task_id)
-                continue
+        for related_id, relation_type in _extract_related_ids(details):
+            graph.add_edge(current_id, related_id, relation_type=relation_type)
+            if related_id not in visited_ids and related_id not in queued_ids:
+                queue.append(related_id)
+                queued_ids.add(related_id)
+                graph.add_node(related_id)
+                total += 1
+                progress.update(task_id, total=total)
 
-            details_by_id[current_id] = details
+        progress.advance(task_id)
 
-            # ----------------------------
-            # CORE FIX: BFS expansion only
-            # ----------------------------
-            for related_id, relation_type in _extract_related_ids(details):
-                graph.add_edge(current_id, related_id, relation_type=relation_type)
-
-                if related_id not in visited_ids and related_id not in queued_ids:
-                    queue.append(related_id)
-                    queued_ids.add(related_id)
-                    graph.add_node(related_id)
-
-                    total += 1
-                    progress.update(task_id, total=total)
-
+    # Fetch details for nodes discovered only as relations (not in seed)
+    progress.update(task_id, total=total + len(graph.nodes))
+    for node in graph.nodes:
+        if node in details_by_id:
+            progress.advance(task_id)
+            continue
+        try:
+            details = await client.get_anime_details(node)
+            if isinstance(details, dict):
+                details_by_id[node] = details
+        except (aiohttp.ClientError, asyncio.TimeoutError, RuntimeError, ValueError):
+            pass
+        finally:
             progress.advance(task_id)
 
-        progress.update(task_id, total=total + (len(graph.nodes)))
-        for node in graph.nodes:
-            if node in details_by_id:
-                progress.advance(task_id)
-                continue
-
-            try:
-                details = await client.get_anime_details(node)
-                if isinstance(details, dict):
-                    details_by_id[node] = details
-            except (
-                aiohttp.ClientError,
-                asyncio.TimeoutError,
-                RuntimeError,
-                ValueError,
-            ):
-                continue
-            finally:
-                progress.advance(task_id)
     clusters: list[SeriesCluster] = []
     for component in nx.connected_components(graph):
         member_ids = sorted(int(anime_id) for anime_id in component)
@@ -279,9 +221,7 @@ async def discover_series(
     )
 
     return SeriesDiscoveryResult(
-        graph=graph,
-        clusters=clusters,
-        details_by_id=details_by_id,
+        graph=graph, clusters=clusters, details_by_id=details_by_id
     )
 
 
@@ -290,16 +230,11 @@ async def save_series_clusters(
 ) -> None:
     async with aiosqlite.connect(db_path) as db:
         await db.execute("DELETE FROM series")
-
         for cluster in clusters:
             await db.execute(
                 """
-                INSERT INTO series(
-                    series_name,
-                    member_ids_json,
-                    member_count,
-                    representative_mal_id
-                ) VALUES (?, ?, ?, ?)
+                INSERT INTO series(series_name, member_ids_json, member_count, representative_mal_id)
+                VALUES (?, ?, ?, ?)
                 """,
                 (
                     cluster.series_name,
@@ -308,5 +243,4 @@ async def save_series_clusters(
                     cluster.representative_id,
                 ),
             )
-
         await db.commit()

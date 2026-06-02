@@ -6,6 +6,8 @@ import logging
 import sys
 from pathlib import Path
 
+from rich.logging import RichHandler
+
 
 def setup_logging(level: int = logging.INFO, log_file: Path | None = None) -> None:
     """Configure logging with structured format for production.
@@ -14,13 +16,14 @@ def setup_logging(level: int = logging.INFO, log_file: Path | None = None) -> No
         level: Logging level (default: INFO)
         log_file: Optional path to log file for persistent logging
     """
-    formatter = logging.Formatter(
-        fmt="[%(asctime)s] %(levelname)-8s %(name)s - %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
+
+    formatter = logging.Formatter()
 
     # Console handler
-    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler = RichHandler(
+        rich_tracebacks=True,
+        show_time=True,
+    )
     console_handler.setLevel(level)
     console_handler.setFormatter(formatter)
 
