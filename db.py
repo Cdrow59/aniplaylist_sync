@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from typing import Iterable
 
@@ -10,10 +11,19 @@ import aiosqlite
 
 from aniplaylist import SearchResult
 
+logger = logging.getLogger(__name__)
 DB_PATH = Path("aniplaylist.sqlite3")
 
 
 async def init_db(db_path: Path) -> None:
+    """Initialize the SQLite database with required tables.
+
+    Creates tables for searches, results, failed searches, and series data.
+    All tables include mal_id for tracking MyAnimeList identifiers.
+
+    Args:
+        db_path: Path to the SQLite database file
+    """
     async with aiosqlite.connect(db_path) as db:
         await db.execute("PRAGMA foreign_keys = ON")
         await db.execute("""
@@ -70,6 +80,7 @@ async def init_db(db_path: Path) -> None:
             )
             """)
         await db.commit()
+        logger.info(f"Database initialized at {db_path}")
 
 
 async def save_run(
@@ -82,6 +93,20 @@ async def save_run(
     english_title: str | None = None,
     japanese_title: str | None = None,
 ) -> None:
+    """Save a successful search with its results to the database.
+
+    Stores search metadata and all matching results. The query field contains
+    all search attempt details for auditing purposes.
+
+    Args:
+        db_path: Path to the SQLite database file
+        query: Search query used (can include JSON attempt details)
+        results: Iterable of SearchResult objects
+        mal_id: MyAnimeList ID for the anime
+        native_title: Native title (typically Japanese)
+        english_title: English title if available
+        japanese_title: Japanese title if available
+    """
     result_rows = list(results)
 
     async with aiosqlite.connect(db_path) as db:
@@ -134,6 +159,7 @@ async def save_run(
             )
 
         await db.commit()
+        logger.debug(f"Saved search with MAL ID {mal_id}: {len(result_rows)} results")
 
 
 async def save_failure(
@@ -147,6 +173,21 @@ async def save_failure(
     japanese_title: str | None = None,
     status: str | None = None,
 ) -> None:
+    """Save a failed search to the database for auditing and recovery.
+
+    Stores complete failure information including the attempt details (query field),
+    reason for failure, and MAL metadata.
+
+    Args:
+        db_path: Path to the SQLite database file
+        query: Search query or JSON with attempt details (for recovery)
+        reason: Reason for the failure
+        mal_id: MyAnimeList ID for the anime
+        native_title: Native title (typically Japanese)
+        english_title: English title if available
+        japanese_title: Japanese title if available
+        status: User's watch status on MAL if available
+    """
     async with aiosqlite.connect(db_path) as db:
         await db.execute(
             """
@@ -171,3 +212,4 @@ async def save_failure(
             ),
         )
         await db.commit()
+        logger.debug(f"Saved failure for MAL ID {mal_id}: {reason}")

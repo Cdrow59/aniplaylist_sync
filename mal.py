@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import Any
@@ -15,6 +16,8 @@ from rich.progress import (
     TimeElapsedColumn,
     TimeRemainingColumn,
 )
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Simple rate-limited session
@@ -116,7 +119,7 @@ class MALClient:
         *,
         progress: Progress | None = None,
     ) -> list[MALAnimeEntry]:
-        user_path = self.username or "@me"
+        user_path = self.username
 
         url = f"{self.base_url}/users/{user_path}/animelist"
 
