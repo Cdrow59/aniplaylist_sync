@@ -1,27 +1,17 @@
+"""MAL API client."""
+
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
-from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import Any
 
 import aiohttp
-from rich.progress import (
-    BarColumn,
-    MofNCompleteColumn,
-    Progress,
-    TextColumn,
-    TimeElapsedColumn,
-    TimeRemainingColumn,
-)
+from rich.progress import Progress
 
 logger = logging.getLogger(__name__)
-
-# ---------------------------------------------------------------------------
-# Simple rate-limited session
-# ---------------------------------------------------------------------------
 
 
 class RateLimitedSession:
@@ -34,23 +24,15 @@ class RateLimitedSession:
     async def get(self, *args, **kwargs):
         async with self._lock:
             now = asyncio.get_running_loop().time()
-
             if self._last_request:
                 delay = (1.0 / self.per_second) - (now - self._last_request)
                 if delay > 0:
                     await asyncio.sleep(delay)
-
             self._last_request = asyncio.get_running_loop().time()
-
         return await self._session.get(*args, **kwargs)
 
     async def close(self):
         await self._session.close()
-
-
-# ---------------------------------------------------------------------------
-# MAL models
-# ---------------------------------------------------------------------------
 
 
 @dataclass(slots=True)
@@ -63,11 +45,6 @@ class MALAnimeEntry:
     score: float | None = None
     num_episodes_watched: int | None = None
     raw: dict[str, Any] | None = None
-
-
-# ---------------------------------------------------------------------------
-# MAL client
-# ---------------------------------------------------------------------------
 
 
 @dataclass(slots=True)
@@ -106,23 +83,26 @@ class MALClient:
             params=params,
             timeout=aiohttp.ClientTimeout(total=30),
         )
-
         if resp.status >= 400:
             text = await resp.text()
             raise RuntimeError(f"MAL request failed ({resp.status}): {text[:500]}")
-
         return json.loads(await resp.text())
 
     async def list_user_anime(
         self,
         status: str | None = None,
         *,
-        progress: Progress | None = None,
+        progress: Progress,
     ) -> list[MALAnimeEntry]:
-        user_path = self.username
+        """Fetch the user's anime list.
 
-        url = f"{self.base_url}/users/{user_path}/animelist"
-
+        Args:
+            status: Optional MAL watch-status filter.
+            progress: A *started* Rich Progress instance owned by the caller.
+                      A task will be added and advanced; the caller retains
+                      ownership and must not stop the Progress here.
+        """
+        url = f"{self.base_url}/users/{self.username}/animelist"
         params: dict[str, object] = {
             "fields": "list_status,alternative_titles",
             "limit": 1000,
@@ -132,93 +112,42 @@ class MALClient:
 
         entries: list[MALAnimeEntry] = []
         offset = 0
+        task = progress.add_task("MAL", total=None)
 
-        progress_context = (
-            Progress(
-                TextColumn("[progress.description]{task.description}"),
-                BarColumn(),
-                MofNCompleteColumn(),
-                TimeElapsedColumn(),
-                TimeRemainingColumn(),
-            )
-            if progress is None
-            else nullcontext(progress)
-        )
+        while True:
+            payload = await self._get_json(url, {**params, "offset": offset})
 
-        with progress_context as progress:
-            assert progress is not None
-
-            task = progress.add_task("MAL", total=None)
-
-            while True:
-                payload = await self._get_json(
-                    url,
-                    {**params, "offset": offset},
-                )
-
-                for item in payload.get("data", []):
-                    node = item.get("node", {})
-                    status = item.get("list_status", {})
-
-                    entries.append(
-                        MALAnimeEntry(
-                            mal_id=int(node.get("id")),
-                            title=str(node.get("title") or ""),
-                            alternative_titles=node.get("alternative_titles"),
-                            status=status.get("status"),
-                            score=(
-                                float(status["score"])
-                                if status.get("score") is not None
-                                else None
-                            ),
-                            num_episodes_watched=(
-                                int(status["num_episodes_watched"])
-                                if status.get("num_episodes_watched") is not None
-                                else None
-                            ),
-                            raw=item,
-                        )
+            for item in payload.get("data", []):
+                node = item.get("node", {})
+                list_status = item.get("list_status", {})
+                entries.append(
+                    MALAnimeEntry(
+                        mal_id=int(node.get("id")),
+                        title=str(node.get("title") or ""),
+                        alternative_titles=node.get("alternative_titles"),
+                        status=list_status.get("status"),
+                        score=(
+                            float(list_status["score"])
+                            if list_status.get("score") is not None
+                            else None
+                        ),
+                        num_episodes_watched=(
+                            int(list_status["num_episodes_watched"])
+                            if list_status.get("num_episodes_watched") is not None
+                            else None
+                        ),
+                        raw=item,
                     )
+                )
+                progress.advance(task)
 
-                    progress.advance(task)
+            paging = payload.get("paging", {})
+            if not paging.get("next"):
+                break
+            offset += int(params["limit"])
 
-                paging = payload.get("paging", {})
-                next_url = paging.get("next")
-
-                if not next_url:
-                    break
-
-                offset += int(params["limit"])
-
-            progress.update(task, total=len(entries))
-
+        progress.update(task, total=len(entries))
         return entries
 
     async def close(self) -> None:
         await self.session.close()
-
-
-# ---------------------------------------------------------------------------
-# Example
-# ---------------------------------------------------------------------------
-
-
-async def main():
-    client = MALClient(
-        client_id="YOUR_CLIENT_ID",
-        access_token="YOUR_ACCESS_TOKEN",
-        username="@me",
-    )
-
-    try:
-        anime = await client.list_user_anime()
-        print(f"Found {len(anime)} entries")
-
-        for entry in anime[:10]:
-            print(entry.title)
-    finally:
-        await client.close()
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
