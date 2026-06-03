@@ -306,9 +306,8 @@ async def run_aniplaylist_stage(
 
 async def run(args) -> None:
     """Main entry point with timeout protection and resource cleanup."""
-    timeout_seconds = getattr(args, "timeout", None) or float(
-        os.getenv("SYNC_TIMEOUT_SECONDS", "1800")
-    )
+    timeout_seconds = getattr(args, "timeout", None) or None
+
     logger.info(f"Starting sync with timeout of {timeout_seconds}s")
     try:
         async with asyncio.timeout(timeout_seconds):
@@ -369,7 +368,6 @@ async def _run_impl(args) -> None:
                 logger.error("No MAL anime entries found!!")
                 return
 
-            logger.error(progress.tasks)
             # Run series discovery and AniPlaylist search concurrently.
             # Both stages receive the same live Progress and add their own tasks.
             series_task = asyncio.create_task(
