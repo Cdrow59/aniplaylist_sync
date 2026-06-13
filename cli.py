@@ -91,17 +91,18 @@ def main() -> None:
     log_level = getattr(logging, args.log_level, logging.INFO)
     setup_logging(level=log_level, log_file=Path("aniplaylist_sync.log"))
 
+    logger = logging.getLogger(__name__)
+    logger.debug("Parsed CLI args: %s", vars(args))
+
     # delegate to orchestrator in main.py
     import main as orchestrator
 
     try:
         asyncio.run(orchestrator.run(args))
     except KeyboardInterrupt:
-        logger = logging.getLogger(__name__)
         logger.info("Sync interrupted by user")
         raise
     except Exception as e:
-        logger = logging.getLogger(__name__)
         logger.error(f"Sync failed: {e}", exc_info=True)
         raise
 

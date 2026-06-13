@@ -121,7 +121,7 @@ RETRY_BACKOFF_S = 1.0
 # A "bad" outcome is: stats timed out AND no no-results banner.
 # A genuine zero-results page exits immediately without retrying.
 SCRAPE_RETRIES = 4  # total attempts (1 original + 3 retries)
-SCRAPE_BACKOFF_BASE_S = 3.0  # first retry delay; doubles each time (3 → 6 → 12 s)
+SCRAPE_BACKOFF_BASE_S = 15.0  # first retry delay; doubles each time (3 → 6 → 12 s)
 
 
 # ---------------------------------------------------------------------------
@@ -268,7 +268,7 @@ async def _scroll_until_stable(page: Page) -> None:
         if count == prev_count:
             stable += 1
             if stable >= SCROLL_STABLE_REPS:
-                logger.info("Scroll stable at %d cards after %d steps", count, i + 1)
+                logger.debug("Scroll stable at %d cards after %d steps", count, i + 1)
                 break
         else:
             stable = 0

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import random
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -12,6 +13,8 @@ import aiohttp
 from rich.progress import Progress
 
 logger = logging.getLogger(__name__)
+
+RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 
 
 class RateLimitedSession:
@@ -27,11 +30,13 @@ class RateLimitedSession:
             if self._last_request:
                 delay = (1.0 / self.per_second) - (now - self._last_request)
                 if delay > 0:
+                    logger.debug("Rate limit: sleeping %.3fs", delay)
                     await asyncio.sleep(delay)
             self._last_request = asyncio.get_running_loop().time()
         return await self._session.get(*args, **kwargs)
 
     async def close(self):
+        logger.debug("Closing MAL HTTP session")
         await self._session.close()
 
 
@@ -58,6 +63,12 @@ class MALClient:
 
     def __post_init__(self) -> None:
         self.session = RateLimitedSession(per_second=self.per_second)
+        logger.debug(
+            "MALClient initialized — user=%r  rate_limit=%.2f/s  authenticated=%s",
+            self.username,
+            self.per_second,
+            bool(self.access_token),
+        )
 
     def _headers(self) -> dict[str, str]:
         headers = {"X-MAL-CLIENT-ID": self.client_id}
@@ -66,6 +77,7 @@ class MALClient:
         return headers
 
     async def get_anime_details(self, anime_id: int) -> dict[str, Any]:
+        logger.debug("Fetching anime details for MAL ID %d", anime_id)
         url = f"{self.base_url}/anime/{anime_id}"
         return await self._get_json(
             url,
@@ -77,16 +89,77 @@ class MALClient:
         url: str,
         params: dict[str, object] | None = None,
     ) -> dict[str, Any]:
-        resp = await self.session.get(
-            url,
-            headers=self._headers(),
-            params=params,
-            timeout=aiohttp.ClientTimeout(total=30),
-        )
-        if resp.status >= 400:
-            text = await resp.text()
-            raise RuntimeError(f"MAL request failed ({resp.status}): {text[:500]}")
-        return json.loads(await resp.text())
+        logger.debug("MAL GET %s params=%s", url, params)
+
+        last_exc = None
+
+        for attempt in range(6):  # you can raise this if you want even more persistence
+            try:
+                resp = await self.session.get(
+                    url,
+                    headers=self._headers(),
+                    params=params,
+                    timeout=aiohttp.ClientTimeout(total=30),
+                )
+
+                # -------------------------
+                # RETRYABLE HTTP RESPONSES
+                # -------------------------
+                if resp.status in {429, 500, 502, 503, 504}:
+                    text = await resp.text()
+
+                    # scale delay with your rate limit
+                    base_delay = max(1.5, 6.0 / self.per_second)
+
+                    # exponential backoff (NO CAP)
+                    delay = base_delay * (3**attempt)
+
+                    # jitter (prevents sync retry waves)
+                    delay += random.uniform(base_delay * 0.5, base_delay * 1.5)
+
+                    logger.warning(
+                        "MAL retryable HTTP %d for %s (attempt %d/6), sleeping %.2fs",
+                        resp.status,
+                        url,
+                        attempt + 1,
+                        delay,
+                    )
+
+                    await asyncio.sleep(delay)
+                    last_exc = RuntimeError(f"HTTP {resp.status}: {text[:200]}")
+                    continue
+
+                # -------------------------
+                # FATAL ERRORS (NO RETRY)
+                # -------------------------
+                if resp.status >= 400:
+                    text = await resp.text()
+                    logger.error(
+                        "MAL request failed (%d) for %s: %s",
+                        resp.status,
+                        url,
+                        text[:500],
+                    )
+                    raise RuntimeError(f"MAL request failed ({resp.status})")
+
+                return json.loads(await resp.text())
+
+            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                base_delay = max(1.5, 6.0 / self.per_second)
+                delay = base_delay * (3**attempt)
+                delay += random.uniform(base_delay * 0.5, base_delay * 1.5)
+
+                logger.warning(
+                    "MAL network error %s (attempt %d/6), sleeping %.2fs",
+                    exc,
+                    attempt + 1,
+                    delay,
+                )
+
+                await asyncio.sleep(delay)
+                last_exc = exc
+
+        raise RuntimeError(f"MAL request failed after retries") from last_exc
 
     async def list_user_anime(
         self,
@@ -110,14 +183,27 @@ class MALClient:
         if status:
             params["status"] = status
 
+        logger.info(
+            "Fetching MAL anime list for user=%r status=%s", self.username, status
+        )
+
         entries: list[MALAnimeEntry] = []
         offset = 0
         task = progress.add_task("MAL", total=None)
+        page = 0
 
         while True:
             payload = await self._get_json(url, {**params, "offset": offset})
+            page += 1
+            page_entries = payload.get("data", [])
+            logger.debug(
+                "MAL list page %d (offset=%d) — %d entry(ies)",
+                page,
+                offset,
+                len(page_entries),
+            )
 
-            for item in payload.get("data", []):
+            for item in page_entries:
                 node = item.get("node", {})
                 list_status = item.get("list_status", {})
                 entries.append(
@@ -147,6 +233,9 @@ class MALClient:
             offset += int(params["limit"])
 
         progress.update(task, total=len(entries))
+        logger.info(
+            "Fetched %d MAL anime entry(ies) for user=%r", len(entries), self.username
+        )
         return entries
 
     async def close(self) -> None:

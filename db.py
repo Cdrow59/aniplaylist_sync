@@ -4,18 +4,18 @@ from __future__ import annotations
 
 import json
 import logging
+from parser import SearchResult
 from pathlib import Path
 from typing import Iterable
 
 import aiosqlite
-
-from parser import SearchResult
 
 logger = logging.getLogger(__name__)
 DB_PATH = Path("aniplaylist.sqlite3")
 
 
 async def init_db(db_path: Path) -> None:
+    logger.debug("Initializing database schema at %s", db_path)
     async with aiosqlite.connect(db_path) as db:
         await db.execute("PRAGMA foreign_keys = ON")
         await db.execute("""
@@ -86,6 +86,15 @@ async def save_run(
     japanese_title: str | None = None,
 ) -> None:
     result_rows = list(results)
+    matched_count = sum(1 for r in result_rows if r.matched_query)
+
+    logger.debug(
+        "save_run: mal_id=%s query=%r -> %d result(s), %d matched",
+        mal_id,
+        query,
+        len(result_rows),
+        matched_count,
+    )
 
     async with aiosqlite.connect(db_path) as db:
         cursor = await db.execute(
@@ -108,15 +117,28 @@ async def save_run(
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
-                    search_id, mal_id, native_title, english_title, japanese_title,
-                    result.anime_title, result.song_type, result.sequence, result.title,
+                    search_id,
+                    mal_id,
+                    native_title,
+                    english_title,
+                    japanese_title,
+                    result.anime_title,
+                    result.song_type,
+                    result.sequence,
+                    result.title,
                     json.dumps(result.artists, ensure_ascii=False),
-                    result.spotify_link, int(result.matched_query),
+                    result.spotify_link,
+                    int(result.matched_query),
                 ),
             )
 
         await db.commit()
-        logger.debug(f"Saved search with MAL ID {mal_id}: {len(result_rows)} results")
+        logger.debug(
+            "save_run: committed search_id=%d (mal_id=%s, %d result(s))",
+            search_id,
+            mal_id,
+            len(result_rows),
+        )
 
 
 async def save_failure(
@@ -137,7 +159,15 @@ async def save_failure(
                 mal_id, query, native_title, english_title, japanese_title, status, reason
             ) VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
-            (mal_id, query, native_title, english_title, japanese_title, status, reason),
+            (
+                mal_id,
+                query,
+                native_title,
+                english_title,
+                japanese_title,
+                status,
+                reason,
+            ),
         )
         await db.commit()
-        logger.debug(f"Saved failure for MAL ID {mal_id}: {reason}")
+        logger.debug(f"save_failure: mal_id={mal_id} reason={reason!r}")

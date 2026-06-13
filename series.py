@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import re
 import unicodedata
 from collections import deque
@@ -17,6 +18,8 @@ import networkx as nx
 from rich.progress import Progress
 
 from mal import MALClient
+
+logger = logging.getLogger(__name__)
 
 ALLOWED_SERIES_RELATIONS = {"sequel", "prequel"}
 
@@ -146,12 +149,16 @@ async def discover_series(
     """
     queue = deque(int(anime_id) for anime_id in seed_ids)
     if not queue:
+        logger.info("Series discovery skipped — no seed IDs provided")
         return SeriesDiscoveryResult(graph=nx.Graph(), clusters=[], details_by_id={})
+
+    logger.info("Series discovery started — %d seed ID(s)", len(queue))
 
     visited_ids: set[int] = set()
     queued_ids: set[int] = set(queue)
     graph = nx.Graph()
     details_by_id: dict[int, dict[str, Any]] = {}
+    fetch_failures = 0
 
     task_id = progress.add_task("Series", total=len(queue))
     total = len(queue)
@@ -166,17 +173,41 @@ async def discover_series(
 
         try:
             details = await client.get_anime_details(current_id)
-        except (aiohttp.ClientError, asyncio.TimeoutError, RuntimeError, ValueError):
+        except (
+            aiohttp.ClientError,
+            asyncio.TimeoutError,
+            RuntimeError,
+            ValueError,
+        ) as exc:
+            fetch_failures += 1
+            logger.warning(
+                "Series discovery: failed to fetch details for MAL ID %d: %s",
+                current_id,
+                exc,
+            )
             progress.advance(task_id)
             continue
 
         if not isinstance(details, dict):
+            logger.debug(
+                "Series discovery: unexpected details payload for MAL ID %d (type=%s)",
+                current_id,
+                type(details).__name__,
+            )
             progress.advance(task_id)
             continue
 
         details_by_id[current_id] = details
 
-        for related_id, relation_type in _extract_related_ids(details):
+        related = _extract_related_ids(details)
+        if related:
+            logger.debug(
+                "Series discovery: MAL ID %d has %d related entry(ies)",
+                current_id,
+                len(related),
+            )
+
+        for related_id, relation_type in related:
             graph.add_edge(current_id, related_id, relation_type=relation_type)
             if related_id not in visited_ids and related_id not in queued_ids:
                 queue.append(related_id)
@@ -188,6 +219,12 @@ async def discover_series(
         progress.advance(task_id)
 
     # Fetch details for nodes discovered only as relations (not in seed)
+    remaining = [node for node in graph.nodes if node not in details_by_id]
+    if remaining:
+        logger.debug(
+            "Series discovery: fetching details for %d related-only node(s)",
+            len(remaining),
+        )
     progress.update(task_id, total=total + len(graph.nodes))
     for node in graph.nodes:
         if node in details_by_id:
@@ -197,8 +234,18 @@ async def discover_series(
             details = await client.get_anime_details(node)
             if isinstance(details, dict):
                 details_by_id[node] = details
-        except (aiohttp.ClientError, asyncio.TimeoutError, RuntimeError, ValueError):
-            pass
+        except (
+            aiohttp.ClientError,
+            asyncio.TimeoutError,
+            RuntimeError,
+            ValueError,
+        ) as exc:
+            fetch_failures += 1
+            logger.warning(
+                "Series discovery: failed to fetch details for related MAL ID %d: %s",
+                node,
+                exc,
+            )
         finally:
             progress.advance(task_id)
 
@@ -220,6 +267,13 @@ async def discover_series(
         key=lambda cluster: (cluster.series_name.casefold(), cluster.representative_id)
     )
 
+    logger.info(
+        "Series discovery complete — %d node(s), %d cluster(s), %d fetch failure(s)",
+        len(graph.nodes),
+        len(clusters),
+        fetch_failures,
+    )
+
     return SeriesDiscoveryResult(
         graph=graph, clusters=clusters, details_by_id=details_by_id
     )
@@ -228,9 +282,11 @@ async def discover_series(
 async def save_series_clusters(
     db_path: Path, clusters: Iterable[SeriesCluster]
 ) -> None:
+    cluster_list = list(clusters)
+    logger.debug("Saving %d series cluster(s) to %s", len(cluster_list), db_path)
     async with aiosqlite.connect(db_path) as db:
         await db.execute("DELETE FROM series")
-        for cluster in clusters:
+        for cluster in cluster_list:
             await db.execute(
                 """
                 INSERT INTO series(series_name, member_ids_json, member_count, representative_mal_id)
@@ -244,3 +300,4 @@ async def save_series_clusters(
                 ),
             )
         await db.commit()
+    logger.info("Saved %d series cluster(s)", len(cluster_list))
