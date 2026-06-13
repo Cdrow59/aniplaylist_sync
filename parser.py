@@ -88,6 +88,8 @@ _PUNCT_REPLACEMENTS: dict[str, str] = {
     "\uff0c": ",",
     "\uff0e": ".",
 }
+
+_SUFFIX_RE = re.compile(r"\s*\((tv|ona|ova|movie|special)\)\s*$", re.IGNORECASE)
 _PUNCT_RE = re.compile("[" + re.escape("".join(_PUNCT_REPLACEMENTS)) + "]")
 _WHITESPACE = re.compile(r"\s+")
 _TRAILING_DIGITS = re.compile(r"\d+$")
@@ -100,12 +102,17 @@ def normalize_text(value: str) -> str:
 
 def normalize_for_match(value: str) -> str:
     text = unicodedata.normalize("NFKC", value).casefold().strip()
+    text = strip_media_suffixes(text)
     text = _PUNCT_RE.sub(lambda m: _PUNCT_REPLACEMENTS[m.group()], text)
     return _WHITESPACE.sub(" ", text).strip()
 
 
 def exact_key_set(titles: Iterable[str]) -> set[str]:
     return {normalize_for_match(t) for t in titles if t and t.strip()}
+
+
+def strip_media_suffixes(value: str) -> str:
+    return _SUFFIX_RE.sub("", value).strip()
 
 
 def dedup(values: Iterable[str]) -> list[str]:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import re
 from pathlib import Path
@@ -11,6 +12,8 @@ from typing import Any, Iterable
 
 import aiosqlite
 from rich.progress import Progress
+
+logger = logging.getLogger(__name__)
 
 
 def _read_spotify_env(name: str) -> str:
@@ -21,12 +24,15 @@ def _read_spotify_env(name: str) -> str:
         fallback_name = name.replace("SPOTIPY_", "SPOTIFY_", 1)
         fallback_value = os.getenv(fallback_name)
         if fallback_value is not None and fallback_value.strip():
+            logger.debug("Using fallback env var %s for %s", fallback_name, name)
             return fallback_value.strip()
     if name.startswith("SPOTIFY_"):
         fallback_name = name.replace("SPOTIFY_", "SPOTIPY_", 1)
         fallback_value = os.getenv(fallback_name)
         if fallback_value is not None and fallback_value.strip():
+            logger.debug("Using fallback env var %s for %s", fallback_name, name)
             return fallback_value.strip()
+    logger.error("Missing required environment variable: %s", name)
     raise RuntimeError(f"Missing required environment variable: {name}")
 
 
@@ -73,7 +79,9 @@ async def fetch_result_links(db_path: Path) -> list[str]:
             ORDER BY id
         """) as cursor:
             rows = await cursor.fetchall()
-    return [str(row[0]).strip() for row in rows if str(row[0]).strip()]
+    links = [str(row[0]).strip() for row in rows if str(row[0]).strip()]
+    logger.debug("fetch_result_links: %d link(s) found", len(links))
+    return links
 
 
 async def fetch_series_playlist_sources(db_path: Path) -> list[tuple[str, list[int]]]:
@@ -87,11 +95,17 @@ async def fetch_series_playlist_sources(db_path: Path) -> list[tuple[str, list[i
     for series_name, member_ids_json in rows:
         try:
             member_ids = [int(i) for i in json.loads(member_ids_json)]
-        except (TypeError, ValueError, json.JSONDecodeError):
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            logger.warning(
+                "fetch_series_playlist_sources: skipping series %r — bad member_ids_json: %s",
+                series_name,
+                exc,
+            )
             continue
         cleaned_name = str(series_name).strip()
         if cleaned_name and member_ids:
             sources.append((cleaned_name, member_ids))
+    logger.debug("fetch_series_playlist_sources: %d series source(s)", len(sources))
     return sources
 
 
@@ -135,6 +149,7 @@ async def _resolve_album_track_uris(client: Any, album_id: str) -> list[str]:
         if not page.get("next"):
             break
         offset += limit
+    logger.debug("Resolved album %s -> %d track(s)", album_id, len(track_uris))
     return track_uris
 
 
@@ -143,6 +158,7 @@ async def resolve_spotify_link_to_track_uris(
 ) -> list[str]:
     kind, resource_id = spotify_link_kind_and_id(spotify_link)
     if not kind or not resource_id:
+        logger.debug("Could not parse Spotify link: %r", spotify_link)
         return []
     if kind == "track":
         uri = spotify_link_to_track_uri(spotify_link)
@@ -152,7 +168,13 @@ async def resolve_spotify_link_to_track_uris(
             from spotipy.exceptions import SpotifyException
 
             return await _resolve_album_track_uris(client, resource_id)
-        except (SpotifyException, RuntimeError, ValueError, KeyError, TypeError):
+        except (SpotifyException, RuntimeError, ValueError, KeyError, TypeError) as exc:
+            logger.warning(
+                "Failed to resolve album %s (%s) to track URIs: %s",
+                resource_id,
+                spotify_link,
+                exc,
+            )
             return []
     return []
 
@@ -165,7 +187,14 @@ async def create_spotify_playlist(
         resolved_uris.extend(await resolve_spotify_link_to_track_uris(client, link))
     uris = _unique_preserving_order(resolved_uris)
     if not uris:
+        logger.warning(
+            "Playlist '%s' — no resolvable track URIs from %d link(s); skipping creation",
+            name,
+            len(links),
+        )
         return
+
+    logger.info("Creating Spotify playlist '%s' with %d track(s)", name, len(uris))
     playlist = await asyncio.to_thread(
         client.user_playlist_create,
         user=user_id,
@@ -175,8 +204,10 @@ async def create_spotify_playlist(
         description="Created by aniplaylist_sync",
     )
     playlist_id = playlist["id"]
+    logger.debug("Playlist '%s' created (id=%s)", name, playlist_id)
     for uri_batch in _chunked(uris, 100):
         await asyncio.to_thread(client.playlist_add_items, playlist_id, uri_batch)
+    logger.info("Playlist '%s' populated with %d track(s)", name, len(uris))
 
 
 async def run_spotify_stage(
@@ -198,10 +229,13 @@ async def run_spotify_stage(
         import spotipy
         from spotipy.oauth2 import SpotifyOAuth
     except ImportError as exc:
+        logger.error("spotipy is not installed — cannot run Spotify stage")
         raise RuntimeError(
             "spotipy is required for Spotify playlist creation. "
             "Install it before running without --dry-run."
         ) from exc
+
+    logger.info("Starting Spotify stage (megaplaylist=%s)", megaplaylist)
 
     auth_manager = SpotifyOAuth(
         client_id=_read_spotify_env("SPOTIPY_CLIENT_ID"),
@@ -211,6 +245,7 @@ async def run_spotify_stage(
     )
     client = spotipy.Spotify(auth_manager=auth_manager)
     user_id = (await asyncio.to_thread(client.current_user))["id"]
+    logger.debug("Authenticated with Spotify as user_id=%s", user_id)
 
     if megaplaylist:
         playlist_sources: list[tuple[str, list[str]]] = [
@@ -222,7 +257,13 @@ async def run_spotify_stage(
             links = await fetch_playlist_links_for_mal_ids(db_path, member_ids)
             playlist_sources.append((series_name, links))
 
+    logger.info("Spotify stage — %d playlist(s) to process", len(playlist_sources))
+
     task_id = progress.add_task("Spotify", total=len(playlist_sources))
     for playlist_name, links in playlist_sources:
         await create_spotify_playlist(client, user_id, playlist_name, links)
         progress.advance(task_id)
+
+    logger.info(
+        "Spotify stage complete — %d playlist(s) processed", len(playlist_sources)
+    )

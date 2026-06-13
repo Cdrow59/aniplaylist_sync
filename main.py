@@ -124,6 +124,7 @@ async def run_series_stage(
 ) -> None:
     seed_ids = [entry.mal_id for entry in mal_entries]
     if not seed_ids:
+        logger.info("Series stage skipped — no MAL entries to seed discovery")
         return
     discovery = await discover_series(client, seed_ids, progress=progress)
     await save_series_clusters(db_path, discovery.clusters)
@@ -192,7 +193,7 @@ async def _search_one(
     if matched or not exact_filter:
         results = matched if exact_filter else raw_results
         if results:
-            logger.info(
+            logger.debug(
                 "%s Pass 1 matched %d result(s) — skipping portal phase",
                 ctx,
                 len(results),
@@ -342,6 +343,7 @@ async def run_aniplaylist_stage(
     task_id = progress.add_task("AniPlaylist", total=len(mal_entries))
 
     total = len(mal_entries)
+    logger.info("AniPlaylist stage starting — %d title(s) to process", total)
     for n, entry in enumerate(mal_entries, 1):
         ctx = f"[MAL:{entry.mal_id} '{entry.title}']"
         logger.info("%s Starting (%d/%d)", ctx, n, total)
@@ -433,7 +435,7 @@ async def run_aniplaylist_stage(
 
         if results:
             matched_count = sum(1 for r in results if r.matched_query)
-            logger.info(
+            logger.debug(
                 "%s Done — query='%s'  results=%d  matched=%d",
                 ctx,
                 used_query,
@@ -506,6 +508,8 @@ async def run(args) -> None:
     except asyncio.TimeoutError:
         logger.error(f"Sync operation timed out after {timeout_seconds}s")
         raise
+    else:
+        logger.info("Sync completed successfully")
 
 
 async def _run_impl(args) -> None:
@@ -545,11 +549,18 @@ async def _run_impl(args) -> None:
             )
 
             if args.limit and args.limit > 0:
+                logger.info(
+                    "Limiting MAL entries from %d to %d per --limit",
+                    len(mal_entries),
+                    args.limit,
+                )
                 mal_entries = mal_entries[: args.limit]
 
             if not mal_entries:
                 logger.error("No MAL anime entries found!!")
                 return
+
+            logger.info("Proceeding with %d MAL entry(ies)", len(mal_entries))
 
             series_task = asyncio.create_task(
                 run_series_stage(args.db, client, mal_entries, progress=progress)
@@ -568,6 +579,13 @@ async def _run_impl(args) -> None:
 
             summary, _ = await asyncio.gather(aniplaylist_task, series_task)
 
+            matched_total = sum(1 for s in summary if s.get("matched"))
+            logger.info(
+                "AniPlaylist stage complete — %d/%d title(s) matched",
+                matched_total,
+                len(summary),
+            )
+
             if not args.dry_run:
                 from spotify import run_spotify_stage
 
@@ -578,13 +596,18 @@ async def _run_impl(args) -> None:
                             megaplaylist=bool(args.megaplaylist),
                             progress=progress,
                         )
-
+                    else:
+                        logger.info(
+                            "Spotify stage skipped — user declined confirmation"
+                        )
                 else:
                     await run_spotify_stage(
                         args.db,
                         megaplaylist=bool(args.megaplaylist),
                         progress=progress,
                     )
+            else:
+                logger.info("Dry run enabled — skipping Spotify stage")
     finally:
         try:
             await client.close()
