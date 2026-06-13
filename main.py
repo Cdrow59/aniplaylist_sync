@@ -21,7 +21,15 @@ from rich.progress import (
 )
 from rich.prompt import Confirm, Prompt
 
-from db import DB_PATH, init_db, save_failure, save_run
+from db import (
+    DB_PATH,
+    FAILURE_NO_MATCH,
+    FAILURE_NOT_FOUND,
+    FAILURE_SCRAPE_ERROR,
+    init_db,
+    save_failure,
+    save_run,
+)
 from mal import MALAnimeEntry, MALClient
 from scraper import scrape
 from series import discover_series, save_series_clusters
@@ -138,6 +146,7 @@ async def _search_one(
     *,
     mal_id: int,
     mal_title: str,
+    save_html: bool,
     allow_pass2: bool = True,
 ) -> tuple[list[SearchResult], list[dict], bool]:
     """
@@ -169,7 +178,7 @@ async def _search_one(
         )
         return [], attempt_logs, False
 
-    raw_results = parse(scrape_result, exact_titles=exact_titles)
+    raw_results = parse(scrape_result, exact_titles=exact_titles, save_html=save_html)
     matched = [r for r in raw_results if r.matched_query]
 
     logger.info(
@@ -249,7 +258,7 @@ async def _search_one(
         )
         return [], attempt_logs, True
 
-    raw_results2 = parse(scrape_result2, exact_titles=exact_titles)
+    raw_results2 = parse(scrape_result2, exact_titles=exact_titles, save_html=save_html)
     matched2 = [r for r in raw_results2 if r.matched_query]
 
     advanced_card_checks = [
@@ -337,6 +346,7 @@ async def run_aniplaylist_stage(
     exact_filter: bool,
     aniplaylist_delay: float,
     emit_json: bool,
+    save_html: bool,
     progress: Progress,
 ) -> list[dict[str, object]]:
     summary: list[dict[str, object]] = []
@@ -354,8 +364,8 @@ async def run_aniplaylist_stage(
         results: list[SearchResult] = []
         used_query = titles_to_try[0] if titles_to_try else entry.title
         all_attempt_logs: list[dict] = []
-        last_error_reason: str | None = None
-        search_succeeded = False
+        any_scrape_succeeded = False
+        total_cards_seen = 0
 
         # ── Loop 1: exhaust all title candidates with Pass 1 only ────────
         # Portals are expensive — try every title variant via simple search
@@ -369,19 +379,20 @@ async def run_aniplaylist_stage(
                 mal_id=entry.mal_id,
                 mal_title=entry.title,
                 allow_pass2=False,
+                save_html=save_html,
             )
             all_attempt_logs.extend(attempt_logs)
+            total_cards_seen += sum(log.get("result_count", 0) for log in attempt_logs)
 
             if not succeeded:
-                last_error_reason = next(
-                    (e["error"] for e in reversed(attempt_logs) if e.get("error")), None
-                )
                 logger.warning(
-                    "%s Query '%s' failed: %s", ctx, title_query, last_error_reason
+                    "%s Query '%s' failed",
+                    ctx,
+                    title_query,
                 )
                 continue
 
-            search_succeeded = True
+            any_scrape_succeeded = True
             used_query = title_query
 
             if results:
@@ -408,20 +419,22 @@ async def run_aniplaylist_stage(
                     mal_id=entry.mal_id,
                     mal_title=entry.title,
                     allow_pass2=True,
+                    save_html=save_html,
                 )
                 all_attempt_logs.extend(attempt_logs)
+                total_cards_seen += sum(
+                    log.get("result_count", 0) for log in attempt_logs
+                )
 
                 if not succeeded:
-                    last_error_reason = next(
-                        (e["error"] for e in reversed(attempt_logs) if e.get("error")),
-                        None,
-                    )
                     logger.warning(
-                        "%s Query '%s' failed: %s", ctx, title_query, last_error_reason
+                        "%s Query '%s' failed",
+                        ctx,
+                        title_query,
                     )
                     continue
 
-                search_succeeded = True
+                any_scrape_succeeded = True
                 used_query = title_query
 
                 if results:
@@ -443,28 +456,39 @@ async def run_aniplaylist_stage(
                 matched_count,
             )
         else:
-            failure_query = json.dumps(all_attempt_logs, ensure_ascii=False)
-            failure_reason = (
-                "No AniPlaylist results matched"
-                if search_succeeded
-                else (last_error_reason or "AniPlaylist search failed")
-            )
+            # Classify precisely so the DB is queryable by cause:
+            #   scrape_error — every attempt threw before returning any cards
+            #   not_found    — scrapes succeeded but AniPlaylist had zero cards
+            #   no_match     — cards came back but none matched our titles
+            if not any_scrape_succeeded:
+                failure_type = FAILURE_SCRAPE_ERROR
+            elif total_cards_seen == 0:
+                failure_type = FAILURE_NOT_FOUND
+            else:
+                failure_type = FAILURE_NO_MATCH
+
             logger.warning(
-                "%s No results — reason: %s  (tried %d candidate(s): %s)",
+                "%s No results — failure_type=%r  cards_seen=%d  tried=%s",
                 ctx,
-                failure_reason,
-                len(titles_to_try),
+                failure_type,
+                total_cards_seen,
                 titles_to_try,
             )
             await save_failure(
                 db_path,
-                failure_query,
-                reason=failure_reason,
+                failure_type=failure_type,
+                tried_queries=titles_to_try,
+                cards_seen=total_cards_seen,
                 mal_id=entry.mal_id,
                 native_title=native_title,
                 english_title=english_title,
                 japanese_title=japanese_title,
-                status=entry.status,
+                mal_status=entry.status,
+                # Skip storing attempt_log for clean not_found cases — zero
+                # cards means there's nothing useful to inspect per-attempt.
+                attempt_log=(
+                    all_attempt_logs if failure_type != FAILURE_NOT_FOUND else None
+                ),
             )
 
         await save_run(
@@ -574,6 +598,7 @@ async def _run_impl(args) -> None:
                     aniplaylist_delay=aniplaylist_delay,
                     emit_json=args.json,
                     progress=progress,
+                    save_html=args.save_html,
                 )
             )
 

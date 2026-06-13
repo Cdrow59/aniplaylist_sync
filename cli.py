@@ -51,6 +51,9 @@ def _make_argparser() -> argparse.ArgumentParser:
         "--confirm", action="store_true", help="Confirm running spotify"
     )
     parser.add_argument(
+        "--save-html", action="store_true", help="Save raw html for debugging"
+    )
+    parser.add_argument(
         "--aniplaylist-delay",
         type=float,
         default=None,

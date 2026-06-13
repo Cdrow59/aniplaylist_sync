@@ -225,3 +225,6 @@ __marimo__/
 
 #Backups
 *.bak
+
+#debug 
+debug/*
