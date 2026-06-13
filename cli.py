@@ -48,6 +48,9 @@ def _make_argparser() -> argparse.ArgumentParser:
         "--headed", action="store_true", help="Run Playwright in headed mode"
     )
     parser.add_argument(
+        "--confirm", action="store_true", help="Confirm running spotify"
+    )
+    parser.add_argument(
         "--aniplaylist-delay",
         type=float,
         default=None,

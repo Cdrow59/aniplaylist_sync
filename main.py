@@ -1,8 +1,4 @@
-"""Main orchestration and stages for MAL -> AniPlaylist sync.
-
-This module owns the single Rich Progress instance for the entire run and
-passes it down to every sub-stage.  No sub-module creates its own Progress.
-"""
+"""Main orchestration and stages for MAL -> AniPlaylist sync."""
 
 from __future__ import annotations
 
@@ -10,8 +6,10 @@ import asyncio
 import json
 import logging
 import os
+from parser import SearchResult, parse
 from pathlib import Path
 
+import rich
 from playwright.async_api import Error as PlaywrightError
 from rich.progress import (
     BarColumn,
@@ -21,10 +19,11 @@ from rich.progress import (
     TimeElapsedColumn,
     TimeRemainingColumn,
 )
+from rich.prompt import Confirm, Prompt
 
-from aniplaylist import SearchResult, close_browser_pool, search_aniplaylist
 from db import DB_PATH, init_db, save_failure, save_run
 from mal import MALAnimeEntry, MALClient
+from scraper import scrape
 from series import discover_series, save_series_clusters
 
 logger = logging.getLogger(__name__)
@@ -105,13 +104,14 @@ def normalize_status(value: str) -> str:
     normalized = value.strip().lower().replace("-", "_")
     if normalized not in MAL_STATUS_ALIASES:
         raise ValueError(
-            "Invalid status. Use one of: complete, completed, watching, on_hold, dropped, plan_to_watch"
+            "Invalid status. Use one of: complete, completed, watching, "
+            "on_hold, dropped, plan_to_watch"
         )
     return MAL_STATUS_ALIASES[normalized]
 
 
 # ---------------------------------------------------------------------------
-# Stage helpers – all accept an already-started Progress from the caller
+# Stage helpers
 # ---------------------------------------------------------------------------
 
 
@@ -122,12 +122,210 @@ async def run_series_stage(
     *,
     progress: Progress,
 ) -> None:
-    """Discover series clusters and persist them.  Progress is owned by caller."""
     seed_ids = [entry.mal_id for entry in mal_entries]
     if not seed_ids:
         return
     discovery = await discover_series(client, seed_ids, progress=progress)
     await save_series_clusters(db_path, discovery.clusters)
+
+
+async def _search_one(
+    title_query: str,
+    exact_titles: list[str],
+    exact_filter: bool,
+    headed: bool,
+    *,
+    mal_id: int,
+    mal_title: str,
+    allow_pass2: bool = True,
+) -> tuple[list[SearchResult], list[dict], bool]:
+    """
+    Run one scrape+parse cycle for *title_query*.
+
+    Pass 1 — Phase 1 only (no portal clicks).
+    If exact_filter is on, no cards matched by title, and allow_pass2 is
+    True, run Pass 2 — re-scrape with portals opened only for unmatched cards.
+
+    Returns (results, attempt_log_entries, search_succeeded).
+    """
+    ctx = f"[MAL:{mal_id} '{mal_title}']"
+    attempt_logs: list[dict] = []
+
+    # ── Pass 1: static data only ──────────────────────────────────────────
+    logger.info("%s Pass 1 — querying '%s'", ctx, title_query)
+    try:
+        scrape_result = await scrape(title_query, headless=not headed, mal_label=ctx)
+    except (PlaywrightError, RuntimeError, ValueError, OSError) as exc:
+        logger.warning("%s Pass 1 failed for query '%s': %s", ctx, title_query, exc)
+        attempt_logs.append(
+            {
+                "pass": 1,
+                "query": title_query,
+                "result_count": 0,
+                "matched_count": 0,
+                "error": str(exc),
+            }
+        )
+        return [], attempt_logs, False
+
+    raw_results = parse(scrape_result, exact_titles=exact_titles)
+    matched = [r for r in raw_results if r.matched_query]
+
+    logger.info(
+        "%s Pass 1 done — query='%s'  cards=%d  matched=%d",
+        ctx,
+        title_query,
+        len(raw_results),
+        len(matched),
+    )
+    attempt_logs.append(
+        {
+            "pass": 1,
+            "query": title_query,
+            "result_count": len(raw_results),
+            "matched_count": len(matched),
+            "error": None,
+        }
+    )
+
+    # Matched on title alone — no portal needed
+    if matched or not exact_filter:
+        results = matched if exact_filter else raw_results
+        if results:
+            logger.info(
+                "%s Pass 1 matched %d result(s) — skipping portal phase",
+                ctx,
+                len(results),
+            )
+        return results, attempt_logs, True
+
+    # ── Pass 2: open portals for unmatched cards only ─────────────────────
+    unmatched_indices = {
+        r.source_index
+        for r in raw_results
+        if r.source_index is not None and not r.matched_query
+    }
+
+    if not unmatched_indices:
+        logger.info("%s Pass 1 returned no cards — nothing to escalate", ctx)
+        return [], attempt_logs, True
+
+    if not allow_pass2:
+        logger.debug(
+            "%s Pass 2 deferred — %d unmatched card(s), will retry after all Pass 1 candidates exhausted",
+            ctx,
+            len(unmatched_indices),
+        )
+        return [], attempt_logs, True
+
+    logger.warning(
+        "%s Pass 1 found no title match across %d card(s) — "
+        "escalating to Pass 2 (portal synonym check) for indices %s",
+        ctx,
+        len(raw_results),
+        sorted(unmatched_indices),
+    )
+
+    try:
+        scrape_result2 = await scrape(
+            title_query,
+            headless=not headed,
+            fetch_portal_indices=unmatched_indices,
+            mal_label=ctx,
+        )
+    except (PlaywrightError, RuntimeError, ValueError, OSError) as exc:
+        logger.error(
+            "%s Pass 2 scrape failed for query '%s': %s", ctx, title_query, exc
+        )
+        attempt_logs.append(
+            {
+                "pass": 2,
+                "query": title_query,
+                "result_count": 0,
+                "matched_count": 0,
+                "error": str(exc),
+            }
+        )
+        return [], attempt_logs, True
+
+    raw_results2 = parse(scrape_result2, exact_titles=exact_titles)
+    matched2 = [r for r in raw_results2 if r.matched_query]
+
+    advanced_card_checks = [
+        {
+            "source_index": r.source_index,
+            "anime_title": r.anime_title,
+            "matched_query": r.matched_query,
+            "matched_synonym": r.advanced_matched_synonym,
+            "synonyms": r.advanced_synonyms or [],
+            "advanced_error": r.advanced_error,
+        }
+        for r in raw_results2
+        if r.advanced_attempted
+    ]
+
+    if matched2:
+        for r in raw_results2:
+            if r.matched_query and r.advanced_matched_synonym:
+                logger.info(
+                    "%s Pass 2 matched via synonym '%s' on card %s ('%s')",
+                    ctx,
+                    r.advanced_matched_synonym,
+                    r.source_index,
+                    r.anime_title,
+                )
+        logger.info(
+            "%s Pass 2 done — query='%s'  portals_opened=%d  matched=%d",
+            ctx,
+            title_query,
+            len(unmatched_indices),
+            len(matched2),
+        )
+    else:
+        for check in advanced_card_checks:
+            if check["advanced_error"]:
+                logger.warning(
+                    "%s Pass 2 card %s ('%s') portal error: %s",
+                    ctx,
+                    check["source_index"],
+                    check["anime_title"],
+                    check["advanced_error"],
+                )
+            elif check["synonyms"]:
+                logger.debug(
+                    "%s Pass 2 card %s ('%s') synonyms checked: %s — no match",
+                    ctx,
+                    check["source_index"],
+                    check["anime_title"],
+                    check["synonyms"],
+                )
+            else:
+                logger.debug(
+                    "%s Pass 2 card %s ('%s') — no synonyms in portal",
+                    ctx,
+                    check["source_index"],
+                    check["anime_title"],
+                )
+        logger.warning(
+            "%s Pass 2 exhausted — query='%s'  portals_opened=%d  no match found",
+            ctx,
+            title_query,
+            len(unmatched_indices),
+        )
+
+    attempt_logs.append(
+        {
+            "pass": 2,
+            "query": title_query,
+            "result_count": len(raw_results2),
+            "matched_count": len(matched2),
+            "advanced_card_checks": advanced_card_checks,
+            "error": None,
+        }
+    )
+
+    results = matched2 if exact_filter else raw_results2
+    return results, attempt_logs, True
 
 
 async def run_aniplaylist_stage(
@@ -140,126 +338,121 @@ async def run_aniplaylist_stage(
     emit_json: bool,
     progress: Progress,
 ) -> list[dict[str, object]]:
-    """Search AniPlaylist for every MAL entry and persist results.
-    Progress is owned by caller."""
     summary: list[dict[str, object]] = []
     task_id = progress.add_task("AniPlaylist", total=len(mal_entries))
 
-    for entry in mal_entries:
+    total = len(mal_entries)
+    for n, entry in enumerate(mal_entries, 1):
+        ctx = f"[MAL:{entry.mal_id} '{entry.title}']"
+        logger.info("%s Starting (%d/%d)", ctx, n, total)
+
         titles_to_try = candidate_titles(entry)
         native_title, english_title, japanese_title = title_metadata(entry)
         exact_titles = exact_title_candidates(entry)
         results: list[SearchResult] = []
         used_query = titles_to_try[0] if titles_to_try else entry.title
-        attempt_logs: list[dict[str, object]] = []
+        all_attempt_logs: list[dict] = []
         last_error_reason: str | None = None
         search_succeeded = False
 
+        # ── Loop 1: exhaust all title candidates with Pass 1 only ────────
+        # Portals are expensive — try every title variant via simple search
+        # before falling back to portal synonym checks.
         for title_query in titles_to_try:
-            try:
-                raw_results = await search_aniplaylist(
-                    title_query,
-                    headless=not headed,
-                    exact_titles=exact_titles,
+            results, attempt_logs, succeeded = await _search_one(
+                title_query,
+                exact_titles,
+                exact_filter,
+                headed,
+                mal_id=entry.mal_id,
+                mal_title=entry.title,
+                allow_pass2=False,
+            )
+            all_attempt_logs.extend(attempt_logs)
+
+            if not succeeded:
+                last_error_reason = next(
+                    (e["error"] for e in reversed(attempt_logs) if e.get("error")), None
                 )
-            except (PlaywrightError, RuntimeError, ValueError, OSError) as exc:
-                last_error_reason = str(exc)
-                attempt_logs.append(
-                    {
-                        "mode": "simple",
-                        "query": title_query,
-                        "result_count": 0,
-                        "matched_count": 0,
-                        "error": last_error_reason,
-                    }
+                logger.warning(
+                    "%s Query '%s' failed: %s", ctx, title_query, last_error_reason
                 )
                 continue
 
             search_succeeded = True
             used_query = title_query
-            matched_results = [r for r in raw_results if r.matched_query]
-            attempt_logs.append(
-                {
-                    "mode": "simple",
-                    "query": title_query,
-                    "result_count": len(raw_results),
-                    "matched_count": len(matched_results),
-                    "error": None,
-                }
-            )
 
-            if exact_filter:
-                results = matched_results
-                if results:
-                    break
-                continue
-
-            results = raw_results
             if results:
                 break
+            else:
+                logger.debug(
+                    "%s Query '%s' returned cards but no match — trying next title candidate",
+                    ctx,
+                    title_query,
+                )
 
-        if not results and exact_filter and search_succeeded:
-            logger.warning(
-                f"Advanced AniPlaylist fallback triggered for: {entry.mal_id}"
+        # ── Loop 2: if still no match, retry all candidates with portals ─
+        if not results:
+            logger.info(
+                "%s All Pass 1 candidates exhausted — retrying with portal synonym checks",
+                ctx,
             )
-
             for title_query in titles_to_try:
-                try:
-                    raw_results = await search_aniplaylist(
-                        title_query,
-                        headless=not headed,
-                        exact_titles=exact_titles,
-                        advanced_fallback=True,
+                results, attempt_logs, succeeded = await _search_one(
+                    title_query,
+                    exact_titles,
+                    exact_filter,
+                    headed,
+                    mal_id=entry.mal_id,
+                    mal_title=entry.title,
+                    allow_pass2=True,
+                )
+                all_attempt_logs.extend(attempt_logs)
+
+                if not succeeded:
+                    last_error_reason = next(
+                        (e["error"] for e in reversed(attempt_logs) if e.get("error")),
+                        None,
                     )
-                except (PlaywrightError, RuntimeError, ValueError, OSError) as exc:
-                    last_error_reason = str(exc)
-                    attempt_logs.append(
-                        {
-                            "mode": "advanced",
-                            "query": title_query,
-                            "result_count": 0,
-                            "matched_count": 0,
-                            "error": last_error_reason,
-                        }
+                    logger.warning(
+                        "%s Query '%s' failed: %s", ctx, title_query, last_error_reason
                     )
                     continue
 
                 search_succeeded = True
                 used_query = title_query
-                matched_results = [r for r in raw_results if r.matched_query]
-                advanced_card_checks = [
-                    {
-                        "source_index": r.source_index,
-                        "anime_title": r.anime_title,
-                        "matched_query": r.matched_query,
-                        "matched_synonym": r.advanced_matched_synonym,
-                        "synonyms": r.advanced_synonyms or [],
-                        "advanced_error": r.advanced_error,
-                    }
-                    for r in raw_results
-                    if r.advanced_attempted
-                ]
-                attempt_logs.append(
-                    {
-                        "mode": "advanced",
-                        "query": title_query,
-                        "result_count": len(raw_results),
-                        "matched_count": len(matched_results),
-                        "advanced_card_checks": advanced_card_checks,
-                        "error": None,
-                    }
-                )
 
-                results = matched_results if exact_filter else raw_results
                 if results:
                     break
+                else:
+                    logger.debug(
+                        "%s Query '%s' portal check found no match — trying next title candidate",
+                        ctx,
+                        title_query,
+                    )
 
-        if not results:
-            failure_query = json.dumps(attempt_logs, ensure_ascii=False)
+        if results:
+            matched_count = sum(1 for r in results if r.matched_query)
+            logger.info(
+                "%s Done — query='%s'  results=%d  matched=%d",
+                ctx,
+                used_query,
+                len(results),
+                matched_count,
+            )
+        else:
+            failure_query = json.dumps(all_attempt_logs, ensure_ascii=False)
             failure_reason = (
                 "No AniPlaylist results matched"
                 if search_succeeded
                 else (last_error_reason or "AniPlaylist search failed")
+            )
+            logger.warning(
+                "%s No results — reason: %s  (tried %d candidate(s): %s)",
+                ctx,
+                failure_reason,
+                len(titles_to_try),
+                titles_to_try,
             )
             await save_failure(
                 db_path,
@@ -305,9 +498,7 @@ async def run_aniplaylist_stage(
 
 
 async def run(args) -> None:
-    """Main entry point with timeout protection and resource cleanup."""
     timeout_seconds = getattr(args, "timeout", None) or None
-
     logger.info(f"Starting sync with timeout of {timeout_seconds}s")
     try:
         async with asyncio.timeout(timeout_seconds):
@@ -315,15 +506,9 @@ async def run(args) -> None:
     except asyncio.TimeoutError:
         logger.error(f"Sync operation timed out after {timeout_seconds}s")
         raise
-    finally:
-        try:
-            await close_browser_pool()
-        except Exception as e:
-            logger.warning(f"Error closing browser pool: {e}")
 
 
 async def _run_impl(args) -> None:
-    """Internal implementation – owns the single Progress for the whole run."""
     client_id = args.client_id or read_env("MAL_CLIENT_ID")
     access_token = args.access_token or os.getenv("MAL_ACCESS_TOKEN")
     username = args.username or read_env("MAL_USERNAME", "@me")
@@ -347,8 +532,6 @@ async def _run_impl(args) -> None:
     try:
         summary: list[dict[str, object]] = []
 
-        # One Progress instance for the entire run – every stage adds its own
-        # tasks to this shared instance; none of them start or stop it.
         with Progress(
             TextColumn("[progress.description]{task.description}"),
             BarColumn(),
@@ -368,15 +551,8 @@ async def _run_impl(args) -> None:
                 logger.error("No MAL anime entries found!!")
                 return
 
-            # Run series discovery and AniPlaylist search concurrently.
-            # Both stages receive the same live Progress and add their own tasks.
             series_task = asyncio.create_task(
-                run_series_stage(
-                    args.db,
-                    client,
-                    mal_entries,
-                    progress=progress,
-                )
+                run_series_stage(args.db, client, mal_entries, progress=progress)
             )
             aniplaylist_task = asyncio.create_task(
                 run_aniplaylist_stage(
@@ -395,11 +571,20 @@ async def _run_impl(args) -> None:
             if not args.dry_run:
                 from spotify import run_spotify_stage
 
-                await run_spotify_stage(
-                    args.db,
-                    megaplaylist=bool(args.megaplaylist),
-                    progress=progress,
-                )
+                if args.confirm:
+                    if Confirm.ask("Run Spotify?"):
+                        await run_spotify_stage(
+                            args.db,
+                            megaplaylist=bool(args.megaplaylist),
+                            progress=progress,
+                        )
+
+                else:
+                    await run_spotify_stage(
+                        args.db,
+                        megaplaylist=bool(args.megaplaylist),
+                        progress=progress,
+                    )
     finally:
         try:
             await client.close()
