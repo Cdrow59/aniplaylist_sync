@@ -88,6 +88,11 @@ ARTIST_SEL = "span.text-sgreen"
 SPOTIFY_LINK_SEL = r"div.flex-initial.xl\:mt-2 a[aria-label*='Spotify']"
 UNRELEASED_TEXT = "Not yet released on streaming platforms."
 
+# "No results" banner rendered by AniPlaylist when a search returns nothing.
+# Detected by the distinctive wrapper class + a substring of the paragraph text.
+NO_RESULTS_SEL = "div.my-5 > p"
+NO_RESULTS_MARKER = "Sorry, we couldn't find any song or album for your query."
+
 # Dialog
 PORTAL_SEL = "div[data-headlessui-state='open']"
 DIALOG_PANEL_SEL = "div[id^='headlessui-dialog-panel-']"
@@ -111,6 +116,12 @@ PORTAL_CLOSE_S = 0.4
 CARD_HOVER_S = 0.25
 RETRY_COUNT = 3
 RETRY_BACKOFF_S = 1.0
+
+# Retry policy for bad-request / rate-limit detection in scrape().
+# A "bad" outcome is: stats timed out AND no no-results banner.
+# A genuine zero-results page exits immediately without retrying.
+SCRAPE_RETRIES = 4  # total attempts (1 original + 3 retries)
+SCRAPE_BACKOFF_BASE_S = 3.0  # first retry delay; doubles each time (3 → 6 → 12 s)
 
 
 # ---------------------------------------------------------------------------
@@ -144,7 +155,17 @@ class ScrapeResult(TypedDict):
 # ---------------------------------------------------------------------------
 
 
-async def _type_query_and_wait(page: Page, query: str) -> None:
+async def _type_query_and_wait(page: Page, query: str) -> bool:
+    """Submit *query* and wait for the stats counter to update.
+
+    Returns
+    -------
+    bool
+        True  — stats element appeared/updated (normal result or zero-results
+                banner will follow).
+        False — stats timed out; caller should treat this as a possible
+                bad-request / rate-limit condition.
+    """
     previous_stats_text = ""
     stats_loc = page.locator(RESULTS_STATS_SEL)
     if await stats_loc.count():
@@ -209,8 +230,27 @@ async def _type_query_and_wait(page: Page, query: str) -> None:
             },
             timeout=STATS_TIMEOUT_MS,
         )
+        return True
     except PWTimeout:
-        logger.debug("Stats timeout for '%s' — continuing with partial results", query)
+        logger.debug("Stats timeout for '%s' — will check for no-results banner", query)
+        return False
+
+
+async def _is_zero_results_page(page: Page) -> bool:
+    """Return True when AniPlaylist's 'no results' message is visible.
+
+    This is a *genuine* empty search — not a rate-limit or transient error —
+    so the caller should stop retrying immediately.
+    """
+    try:
+        loc = page.locator(NO_RESULTS_SEL)
+        if await loc.count():
+            text = (await loc.first.inner_text()).strip()
+            if NO_RESULTS_MARKER in text:
+                return True
+    except Exception:
+        pass
+    return False
 
 
 async def _scroll_until_stable(page: Page) -> None:
@@ -453,6 +493,11 @@ async def scrape(
     """
     Scrape AniPlaylist for *query*.
 
+    Phase 1 is retried up to ``SCRAPE_RETRIES`` times with exponential
+    backoff when the result looks like a bad request or rate-limit (stats
+    element timed out *and* no no-results banner is present).  A genuine
+    zero-results page exits immediately without retrying.
+
     Parameters
     ----------
     query : str
@@ -489,31 +534,74 @@ async def scrape(
         results: list[ResultItem] = []
 
         try:
-            # ── Phase 1 ──────────────────────────────────────────────────
-            last_err: Exception | None = None
-            for base_url in BASE_URLS:
-                try:
-                    await page.goto(
-                        base_url, wait_until="domcontentloaded", timeout=15_000
+            # ── Phase 1 with retry-on-bad-request ────────────────────────
+            for attempt in range(1, SCRAPE_RETRIES + 1):
+                # (Re-)navigate on every attempt so stale session state is
+                # cleared before re-submitting the query.
+                last_nav_err: Exception | None = None
+                for base_url in BASE_URLS:
+                    try:
+                        await page.goto(
+                            base_url, wait_until="domcontentloaded", timeout=15_000
+                        )
+                        last_nav_err = None
+                        break
+                    except Exception as exc:
+                        last_nav_err = exc
+                if last_nav_err:
+                    raise last_nav_err
+
+                stats_ok = await _type_query_and_wait(page, query)
+                await _scroll_until_stable(page)
+                raw_html_snapshot = await page.content()
+
+                # ── Genuine zero-results page → stop immediately ──────────
+                if await _is_zero_results_page(page):
+                    logger.info(
+                        "%s Zero-results banner detected for query '%s' — no retry",
+                        mal_label,
+                        query,
                     )
-                    last_err = None
+                    # basic_data_list stays empty; break out of retry loop
                     break
-                except Exception as exc:
-                    last_err = exc
-            if last_err:
-                raise last_err
 
-            await _type_query_and_wait(page, query)
-            await _scroll_until_stable(page)
-            raw_html_snapshot = await page.content()
+                basic_data_list = await _extract_basic_data_all(page)
 
-            basic_data_list = await _extract_basic_data_all(page)
-            logger.info(
-                "%s Phase 1 complete — %d cards", mal_label, len(basic_data_list)
-            )
+                if basic_data_list:
+                    # Got real cards — Phase 1 succeeded
+                    logger.info(
+                        "%s Phase 1 complete — %d cards (attempt %d)",
+                        mal_label,
+                        len(basic_data_list),
+                        attempt,
+                    )
+                    for basic in basic_data_list:
+                        results.append(ResultItem(basic_data=basic))
+                    break
 
-            for basic in basic_data_list:
-                results.append(ResultItem(basic_data=basic))
+                # ── No cards and no zero-results banner ───────────────────
+                # Likely a rate-limit, transient server error, or the stats
+                # element timed out before results rendered.
+                if attempt < SCRAPE_RETRIES:
+                    backoff = SCRAPE_BACKOFF_BASE_S * (2 ** (attempt - 1))
+                    logger.warning(
+                        "%s Phase 1 attempt %d/%d — 0 cards, stats_ok=%s; "
+                        "possible rate-limit, retrying in %.1fs",
+                        mal_label,
+                        attempt,
+                        SCRAPE_RETRIES,
+                        stats_ok,
+                        backoff,
+                    )
+                    await asyncio.sleep(backoff)
+                else:
+                    logger.error(
+                        "%s Phase 1 — 0 cards after %d attempts for query '%s'; "
+                        "giving up",
+                        mal_label,
+                        SCRAPE_RETRIES,
+                        query,
+                    )
 
             # ── Phase 2 — only when indices requested ────────────────────
             if fetch_portal_indices is None:
