@@ -1,0 +1,273 @@
+"""
+parser.py — Convert ScrapeResult into SearchResult objects.
+
+Public API
+----------
+    records = parse(scrape_result, exact_titles=["Naruto", ...])
+
+portal_data key presence:
+    absent   — portal was never requested for this card (Phase 1-only scrape)
+               → advanced_* fields left at defaults, no attempt recorded
+    None     — portal requested but all retries failed
+               → advanced_attempted=True, advanced_error set
+    {}       — portal requested, info button not found
+               → no advanced attempt recorded
+    {synonyms, ...}  — extracted; synonym matching applied
+"""
+
+from __future__ import annotations
+
+import logging
+import re
+import unicodedata
+from dataclasses import dataclass
+from typing import Iterable
+
+from scraper import BasicData, ResultItem, ScrapeResult
+
+logger = logging.getLogger(__name__)
+
+_SENTINEL = object()  # distinguishes key-absent from key=None
+
+
+# ---------------------------------------------------------------------------
+# SearchResult
+# ---------------------------------------------------------------------------
+
+
+@dataclass(slots=True)
+class SearchResult:
+    anime_title: str
+    song_type: str
+    sequence: int | None
+    title: str
+    artists: list[str]
+    spotify_link: str | None
+    matched_query: bool
+    source_index: int | None = None
+    advanced_attempted: bool = False
+    advanced_synonyms: list[str] | None = None
+    advanced_matched_synonym: str | None = None
+    advanced_error: str | None = None
+
+
+# ---------------------------------------------------------------------------
+# Text helpers
+# ---------------------------------------------------------------------------
+
+_PUNCT_REPLACEMENTS: dict[str, str] = {
+    "\u2018": "'",
+    "\u2019": "'",
+    "\u02bc": "'",
+    "\uff07": "'",
+    "\u201b": "'",
+    "\u201c": '"',
+    "\u201d": '"',
+    "\u201e": '"',
+    "\u201f": '"',
+    "\uff02": '"',
+    "\u2010": "-",
+    "\u2011": "-",
+    "\u2012": "-",
+    "\u2013": "-",
+    "\u2014": "-",
+    "\u2015": "-",
+    "\u2212": "-",
+    "\ufe58": "-",
+    "\ufe63": "-",
+    "\uff0d": "-",
+    "\uff5e": "~",
+    "\u301c": "~",
+    "\u223c": "~",
+    "\uff01": "!",
+    "\ufe57": "!",
+    "\uff1f": "?",
+    "\ufe56": "?",
+    "\uff1a": ":",
+    "\uff1b": ";",
+    "\uff0c": ",",
+    "\uff0e": ".",
+}
+_PUNCT_RE = re.compile("[" + re.escape("".join(_PUNCT_REPLACEMENTS)) + "]")
+_WHITESPACE = re.compile(r"\s+")
+_TRAILING_DIGITS = re.compile(r"\d+$")
+
+
+def normalize_text(value: str) -> str:
+    text = unicodedata.normalize("NFKC", value)
+    return _WHITESPACE.sub(" ", text).strip().casefold()
+
+
+def normalize_for_match(value: str) -> str:
+    text = unicodedata.normalize("NFKC", value).casefold().strip()
+    text = _PUNCT_RE.sub(lambda m: _PUNCT_REPLACEMENTS[m.group()], text)
+    return _WHITESPACE.sub(" ", text).strip()
+
+
+def exact_key_set(titles: Iterable[str]) -> set[str]:
+    return {normalize_for_match(t) for t in titles if t and t.strip()}
+
+
+def dedup(values: Iterable[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for v in values:
+        v = v.strip()
+        if v and v not in seen:
+            seen.add(v)
+            out.append(v)
+    return out
+
+
+def parse_song_type(raw: str) -> tuple[str, int | None]:
+    label = normalize_text(raw)
+    m = _TRAILING_DIGITS.search(label)
+    seq = int(m.group()) if m else None
+    kind = _TRAILING_DIGITS.sub("", label).strip()
+    return kind, seq
+
+
+def parse_synonyms(raw: str) -> list[str]:
+    return dedup(raw.split(","))
+
+
+# ---------------------------------------------------------------------------
+# Per-item conversion
+# ---------------------------------------------------------------------------
+
+
+def _build_result(
+    basic: BasicData,
+    exact_keys: set[str],
+    portal: dict | None,
+    portal_requested: bool,
+) -> SearchResult | None:
+    """
+    Parameters
+    ----------
+    portal_requested : bool
+        True  — portal_data key was present in the ResultItem (may be None or dict).
+        False — portal was never fetched for this card; skip all advanced logic.
+    """
+    if basic["unreleased"]:
+        return None
+
+    title = normalize_text(basic["title_raw"])
+    if not title:
+        return None
+
+    anime_title = basic["anime_title"]
+    song_type, sequence = parse_song_type(basic["song_type_raw"])
+    artists = dedup(basic["artist_values"])
+    spotify_link = basic["spotify_link"] or None
+    source_index = basic["source_index"]
+
+    matched_query = bool(anime_title and normalize_for_match(anime_title) in exact_keys)
+    advanced_attempted = False
+    advanced_synonyms: list[str] | None = None
+    advanced_matched_synonym: str | None = None
+    advanced_error: str | None = None
+
+    if not matched_query and portal_requested:
+        if portal is None:
+            # Requested but every retry failed
+            advanced_attempted = True
+            advanced_error = "portal extraction failed"
+        elif portal:
+            # Non-empty dict — synonyms and/or partial error
+            if "error" in portal:
+                advanced_error = portal["error"]
+
+            synonyms: list[str] = portal.get("synonyms") or []
+            if synonyms:
+                advanced_attempted = True
+                advanced_synonyms = synonyms
+                hit = next(
+                    (
+                        s
+                        for s in sorted(synonyms, key=len, reverse=True)
+                        if normalize_for_match(s) in exact_keys
+                    ),
+                    None,
+                )
+                if hit is not None:
+                    matched_query = True
+                    advanced_matched_synonym = hit
+        # portal == {} → info button not found, no attempt recorded
+
+    return SearchResult(
+        anime_title=anime_title,
+        song_type=song_type,
+        sequence=sequence,
+        title=title,
+        artists=artists,
+        spotify_link=spotify_link,
+        matched_query=matched_query,
+        source_index=source_index,
+        advanced_attempted=advanced_attempted,
+        advanced_synonyms=advanced_synonyms,
+        advanced_matched_synonym=advanced_matched_synonym,
+        advanced_error=advanced_error,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Public entry point
+# ---------------------------------------------------------------------------
+
+
+def parse(
+    scrape_result: ScrapeResult,
+    exact_titles: Iterable[str] | None = None,
+) -> list[SearchResult]:
+    """
+    Convert a ScrapeResult into a flat list of SearchResult objects.
+
+    Works for both Phase-1-only results (no portal_data key) and full
+    Phase-1+2 results.
+
+    Parameters
+    ----------
+    scrape_result : ScrapeResult
+        Output of ``scraper.scrape()``.
+    exact_titles : iterable of str, optional
+        Candidate anime titles used to determine ``matched_query``.
+        Defaults to the original search query when omitted.
+
+    Returns
+    -------
+    list[SearchResult]
+        Drop-in for ``db.save_run()``.
+    """
+    query = scrape_result["query"]
+    candidates = list(exact_titles) if exact_titles is not None else [query]
+    exact_keys = exact_key_set(candidates)
+
+    results: list[SearchResult] = []
+    dropped = 0
+
+    for item in scrape_result["results"]:
+        # portal_data key absent → portal was never requested for this card
+        portal_requested = "portal_data" in item
+        portal = item.get("portal_data")  # None when key absent or explicitly None
+
+        record = _build_result(
+            basic=item["basic_data"],
+            exact_keys=exact_keys,
+            portal=portal,
+            portal_requested=portal_requested,
+        )
+        if record is None:
+            dropped += 1
+        else:
+            results.append(record)
+
+    logger.debug(
+        "parse(): query=%r  in=%d  kept=%d  dropped=%d  matched=%d",
+        query,
+        len(scrape_result["results"]),
+        len(results),
+        dropped,
+        sum(1 for r in results if r.matched_query),
+    )
+    return results
