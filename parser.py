@@ -21,6 +21,8 @@ import logging
 import re
 import unicodedata
 from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
 from typing import Iterable
 
 from scraper import BasicData, ResultItem, ScrapeResult
@@ -93,6 +95,7 @@ _SUFFIX_RE = re.compile(r"\s*\((tv|ona|ova|movie|special)\)\s*$", re.IGNORECASE)
 _PUNCT_RE = re.compile("[" + re.escape("".join(_PUNCT_REPLACEMENTS)) + "]")
 _WHITESPACE = re.compile(r"\s+")
 _TRAILING_DIGITS = re.compile(r"\d+$")
+_TOKEN_RE = re.compile(r"[^\w]+")
 
 
 def normalize_text(value: str) -> str:
@@ -139,6 +142,61 @@ def parse_synonyms(raw: str) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
+# Synonym scoring
+# ---------------------------------------------------------------------------
+
+
+def _tokenize(text: str) -> set[str]:
+    """Split a normalized string into a set of non-empty word tokens."""
+    return {t for t in _TOKEN_RE.split(text) if t}
+
+
+def _synonym_score(synonym: str, query_tokens: set[str]) -> tuple[int, int]:
+    """
+    Score a synonym for preference when multiple synonyms match exact_keys.
+
+    Returns a tuple (overlap, length) — both higher is better, so sort
+    descending on this tuple.
+
+    overlap : int
+        Number of tokens shared between the normalized synonym and the
+        normalized query that was actually searched.  A synonym that shares
+        more tokens with the query is more specific to this entry (e.g.
+        includes "Part 2" or "2nd Season") and should be preferred.
+
+    length : int
+        Character length of the normalized synonym, used as a tiebreaker.
+        Longer = more specific title = preferred over a short base-series alias.
+    """
+    norm = normalize_for_match(synonym)
+    overlap = len(_tokenize(norm) & query_tokens)
+    return overlap, len(norm)
+
+
+def _best_matching_synonym(
+    synonyms: list[str],
+    exact_keys: set[str],
+    query: str,
+) -> str | None:
+    """
+    Return the synonym from *synonyms* that:
+      1. Normalizes to a key present in *exact_keys* (i.e. is a valid match)
+      2. Among all valid matches, has the highest token overlap with *query*
+         (tiebroken by synonym length, longer preferred)
+
+    Returns None if no synonym matches.
+    """
+    query_tokens = _tokenize(normalize_for_match(query))
+
+    candidates = [s for s in synonyms if normalize_for_match(s) in exact_keys]
+
+    if not candidates:
+        return None
+
+    return max(candidates, key=lambda s: _synonym_score(s, query_tokens))
+
+
+# ---------------------------------------------------------------------------
 # Per-item conversion
 # ---------------------------------------------------------------------------
 
@@ -148,6 +206,7 @@ def _build_result(
     exact_keys: set[str],
     portal: dict | None,
     portal_requested: bool,
+    query: str,
 ) -> SearchResult | None:
     """
     Parameters
@@ -155,6 +214,9 @@ def _build_result(
     portal_requested : bool
         True  — portal_data key was present in the ResultItem (may be None or dict).
         False — portal was never fetched for this card; skip all advanced logic.
+    query : str
+        The search string that was submitted to AniPlaylist for this scrape.
+        Used to score synonyms by relevance when multiple synonyms match.
     """
     if basic["unreleased"]:
         return None
@@ -189,14 +251,7 @@ def _build_result(
             if synonyms:
                 advanced_attempted = True
                 advanced_synonyms = synonyms
-                hit = next(
-                    (
-                        s
-                        for s in sorted(synonyms, key=len, reverse=True)
-                        if normalize_for_match(s) in exact_keys
-                    ),
-                    None,
-                )
+                hit = _best_matching_synonym(synonyms, exact_keys, query)
                 if hit is not None:
                     matched_query = True
                     advanced_matched_synonym = hit
@@ -225,6 +280,7 @@ def _build_result(
 
 def parse(
     scrape_result: ScrapeResult,
+    save_html: bool,
     exact_titles: Iterable[str] | None = None,
 ) -> list[SearchResult]:
     """
@@ -250,6 +306,29 @@ def parse(
     candidates = list(exact_titles) if exact_titles is not None else [query]
     exact_keys = exact_key_set(candidates)
 
+    if save_html:
+        # Debug: save raw HTML snapshot from scraper
+        raw_html = scrape_result.get("raw_html_snapshot")
+        if raw_html:
+            try:
+                debug_dir = Path("debug/raw_html")
+                debug_dir.mkdir(parents=True, exist_ok=True)
+
+                safe_query = "".join(
+                    c if c.isalnum() or c in ("-", "_") else "_" for c in query
+                )
+
+                path = debug_dir / (f"{datetime.now():%Y%m%d_%H%M%S}_{safe_query}.html")
+
+                path.write_text(
+                    raw_html,
+                    encoding="utf-8",
+                )
+
+                logger.debug("Saved raw HTML snapshot: %s", path)
+            except Exception:
+                logger.exception("Failed saving raw HTML snapshot")
+
     results: list[SearchResult] = []
     dropped = 0
 
@@ -263,6 +342,7 @@ def parse(
             exact_keys=exact_keys,
             portal=portal,
             portal_requested=portal_requested,
+            query=query,
         )
         if record is None:
             dropped += 1

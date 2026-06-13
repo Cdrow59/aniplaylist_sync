@@ -23,7 +23,7 @@ ResultItem:
             # None  — extraction attempted, all retries failed
             # {}    — no info button found on this card
             # {...} — synonyms (and optional error) extracted
-            # not present in key when fetch_portals was False for this card
+            # key absent when fetch_portals was False for this card
     }
 
 BasicData:
@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from enum import Enum, auto
 from typing import TypedDict
 
 from playwright.async_api import (
@@ -88,8 +89,6 @@ ARTIST_SEL = "span.text-sgreen"
 SPOTIFY_LINK_SEL = r"div.flex-initial.xl\:mt-2 a[aria-label*='Spotify']"
 UNRELEASED_TEXT = "Not yet released on streaming platforms."
 
-# "No results" banner rendered by AniPlaylist when a search returns nothing.
-# Detected by the distinctive wrapper class + a substring of the paragraph text.
 NO_RESULTS_SEL = "div.my-5 > p"
 NO_RESULTS_MARKER = "Sorry, we couldn't find any song or album for your query."
 
@@ -109,19 +108,29 @@ SCROLL_PAUSE_S = 0.7
 SCROLL_MAX_ITER = 60
 SCROLL_STABLE_REPS = 3
 
+# How long to wait for the stats counter to appear after submitting a query.
 STATS_TIMEOUT_MS = 20_000
+
+# After the stats counter updates, we additionally wait for the card list to
+# reflect the new query before we start scrolling.  This guards against the
+# Algolia race where the counter updates slightly ahead of the DOM.
+CARDS_QUIESCE_TIMEOUT_MS = 8_000
+CARDS_QUIESCE_POLL_MS = 200
+
 PORTAL_TIMEOUT_MS = 8_000
 PORTAL_STABLE_S = 0.4
 PORTAL_CLOSE_S = 0.4
 CARD_HOVER_S = 0.25
-RETRY_COUNT = 3
-RETRY_BACKOFF_S = 1.0
 
-# Retry policy for bad-request / rate-limit detection in scrape().
-# A "bad" outcome is: stats timed out AND no no-results banner.
-# A genuine zero-results page exits immediately without retrying.
-SCRAPE_RETRIES = 4  # total attempts (1 original + 3 retries)
-SCRAPE_BACKOFF_BASE_S = 15.0  # first retry delay; doubles each time (3 → 6 → 12 s)
+# Retry policy for Phase 1.
+# Each attempt launches a completely fresh browser so no JS/cookie/session
+# state bleeds between attempts.
+#
+# Retry is triggered only on TRANSIENT outcomes (stats timeout with no cards
+# and no zero-results banner, or nav failure).  ZERO_RESULTS stops immediately.
+SCRAPE_MAX_ATTEMPTS = 4
+# Base delay in seconds before the Nth retry (doubles each time: 2 → 4 → 8).
+SCRAPE_BACKOFF_BASE_S = 4.0
 
 
 # ---------------------------------------------------------------------------
@@ -151,35 +160,34 @@ class ScrapeResult(TypedDict):
 
 
 # ---------------------------------------------------------------------------
-# Phase 1 — navigate, search, scroll
+# Internal outcome enum for Phase 1
 # ---------------------------------------------------------------------------
 
 
-async def _type_query_and_wait(page: Page, query: str) -> bool:
-    """Submit *query* and wait for the stats counter to update.
+class _Phase1Outcome(Enum):
+    SUCCESS = auto()  # got ≥1 card belonging to this query
+    ZERO_RESULTS = auto()  # genuine empty search; do not retry
+    TRANSIENT = auto()  # timing/rate-limit glitch; retry with backoff
 
-    Returns
-    -------
-    bool
-        True  — stats element appeared/updated (normal result or zero-results
-                banner will follow).
-        False — stats timed out; caller should treat this as a possible
-                bad-request / rate-limit condition.
-    """
-    previous_stats_text = ""
-    stats_loc = page.locator(RESULTS_STATS_SEL)
-    if await stats_loc.count():
-        previous_stats_text = (await stats_loc.first.inner_text()).strip()
 
+# ---------------------------------------------------------------------------
+# Phase 1 helpers
+# ---------------------------------------------------------------------------
+
+
+async def _dismiss_cookie_banner(page: Page) -> None:
     for label in ("Accept all", "Accept", "Reject non-essential"):
         try:
             btn = page.get_by_role("button", name=label)
             if await btn.count():
-                await btn.first.click(timeout=1500)
-                break
+                await btn.first.click(timeout=1_500)
+                return
         except Exception:
             pass
 
+
+async def _submit_query(page: Page, query: str) -> None:
+    """Fill the search box and submit; falls back to DOM injection."""
     search_box = page.locator(SEARCH_INPUT_SEL)
     await search_box.wait_for(state="visible", timeout=15_000)
 
@@ -212,6 +220,12 @@ async def _type_query_and_wait(page: Page, query: str) -> bool:
         )
         await asyncio.sleep(0.25)
 
+
+async def _wait_for_stats_change(page: Page, previous_text: str) -> bool:
+    """
+    Wait for the stats counter to show a number that differs from
+    *previous_text*.  Returns True on success, False on timeout.
+    """
     try:
         await page.wait_for_function(
             r"""
@@ -226,22 +240,17 @@ async def _type_query_and_wait(page: Page, query: str) -> bool:
             """,
             arg={
                 "statsSelector": RESULTS_STATS_SEL,
-                "previousStatsText": previous_stats_text,
+                "previousStatsText": previous_text,
             },
             timeout=STATS_TIMEOUT_MS,
         )
         return True
     except PWTimeout:
-        logger.debug("Stats timeout for '%s' — will check for no-results banner", query)
         return False
 
 
 async def _is_zero_results_page(page: Page) -> bool:
-    """Return True when AniPlaylist's 'no results' message is visible.
-
-    This is a *genuine* empty search — not a rate-limit or transient error —
-    so the caller should stop retrying immediately.
-    """
+    """Return True when AniPlaylist's 'no results' banner is visible."""
     try:
         loc = page.locator(NO_RESULTS_SEL)
         if await loc.count():
@@ -250,6 +259,60 @@ async def _is_zero_results_page(page: Page) -> bool:
                 return True
     except Exception:
         pass
+    return False
+
+
+async def _wait_for_cards_quiesce(page: Page, query: str, mal_label: str) -> bool:
+    """
+    After the stats counter updates, the card DOM may still be showing the
+    previous query's results while Algolia hydrates the new ones.  Poll until
+    at least one card is present and its anime-title text is non-empty,
+    indicating the new result set has landed.
+
+    We intentionally do NOT check whether the card title matches the query —
+    zero-relevant-result pages (e.g. obscure titles) are valid and will have
+    cards whose titles differ from the query.  We only care that the DOM has
+    settled from a loading state into a stable rendered state.
+
+    Returns True when stable, False on timeout.
+    """
+    full_card_sel = f"{RESULTS_CONTAINER_SEL} {RESULT_CARD_SEL}"
+    deadline_ms = CARDS_QUIESCE_TIMEOUT_MS
+    elapsed_ms = 0
+
+    while elapsed_ms < deadline_ms:
+        try:
+            count = await page.locator(full_card_sel).count()
+            if count > 0:
+                # Confirm the first card has rendered its anime-title text —
+                # an empty string means the card shell exists but Algolia
+                # hasn't populated it yet.
+                first_title = await (
+                    page.locator(full_card_sel)
+                    .nth(0)
+                    .locator(ANIME_TITLE_SEL)
+                    .inner_text(timeout=500)
+                )
+                if first_title.strip():
+                    logger.debug(
+                        "%s Cards quiesced — %d card(s), first title=%r",
+                        mal_label,
+                        count,
+                        first_title.strip(),
+                    )
+                    return True
+        except Exception:
+            pass
+
+        await asyncio.sleep(CARDS_QUIESCE_POLL_MS / 1000)
+        elapsed_ms += CARDS_QUIESCE_POLL_MS
+
+    logger.debug(
+        "%s Cards did not quiesce within %dms for query %r",
+        mal_label,
+        CARDS_QUIESCE_TIMEOUT_MS,
+        query,
+    )
     return False
 
 
@@ -305,6 +368,231 @@ async def _extract_basic_data_all(page: Page) -> list[BasicData]:
 
 
 # ---------------------------------------------------------------------------
+# Phase 1 — single attempt (fresh browser per call)
+# ---------------------------------------------------------------------------
+
+
+async def _phase1_attempt(
+    query: str,
+    headless: bool,
+    mal_label: str,
+) -> tuple[_Phase1Outcome, list[BasicData], str]:
+    """
+    Run one full Phase 1 attempt in a fresh browser.
+
+    Returns
+    -------
+    outcome : _Phase1Outcome
+    basic_data_list : list[BasicData]  (non-empty only on SUCCESS)
+    raw_html : str
+    """
+    async with async_playwright() as pw:
+        browser: Browser = await pw.chromium.launch(headless=headless)
+        context: BrowserContext = await browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+            viewport={"width": 1200, "height": 1200},
+        )
+        page: Page = await context.new_page()
+        raw_html = ""
+
+        try:
+            # Navigate — try both base URLs
+            last_nav_err: Exception | None = None
+            for base_url in BASE_URLS:
+                try:
+                    await page.goto(
+                        base_url, wait_until="domcontentloaded", timeout=15_000
+                    )
+                    last_nav_err = None
+                    break
+                except Exception as exc:
+                    last_nav_err = exc
+            if last_nav_err:
+                logger.warning("%s Navigation failed: %s", mal_label, last_nav_err)
+                return _Phase1Outcome.TRANSIENT, [], ""
+
+            await _dismiss_cookie_banner(page)
+
+            # Record what the stats counter says *before* we submit so we can
+            # detect when it changes to this query's result count.
+            stats_loc = page.locator(RESULTS_STATS_SEL)
+            previous_stats_text = ""
+            if await stats_loc.count():
+                previous_stats_text = (await stats_loc.first.inner_text()).strip()
+
+            await _submit_query(page, query)
+
+            # ── Wait for stats counter to reflect the new query ──────────
+            stats_updated = await _wait_for_stats_change(page, previous_stats_text)
+
+            if not stats_updated:
+                # Stats timed out.  Check for zero-results banner before
+                # giving up — AniPlaylist sometimes skips the counter on empty
+                # searches and jumps straight to the banner.
+                raw_html = await page.content()
+                if await _is_zero_results_page(page):
+                    logger.info(
+                        "%s Zero-results banner detected (stats timeout path) for query %r",
+                        mal_label,
+                        query,
+                    )
+                    return _Phase1Outcome.ZERO_RESULTS, [], raw_html
+
+                logger.warning(
+                    "%s Stats counter did not update for query %r — likely transient",
+                    mal_label,
+                    query,
+                )
+                return _Phase1Outcome.TRANSIENT, [], raw_html
+
+            # ── Wait for card DOM to reflect the new query ───────────────
+            # This is the critical guard against stale-card reads.
+            # The stats counter may update slightly before Algolia replaces
+            # the card list, so we poll until at least one rendered card is
+            # present with a non-empty title.
+            cards_ready = await _wait_for_cards_quiesce(page, query, mal_label)
+
+            if not cards_ready:
+                # No cards after the counter updated.  Either genuine zero
+                # results (banner not yet rendered) or a transient glitch.
+                raw_html = await page.content()
+                if await _is_zero_results_page(page):
+                    logger.info(
+                        "%s Zero-results banner detected (quiesce timeout path) for query %r",
+                        mal_label,
+                        query,
+                    )
+                    return _Phase1Outcome.ZERO_RESULTS, [], raw_html
+
+                logger.warning(
+                    "%s Card DOM did not quiesce for query %r — treating as transient",
+                    mal_label,
+                    query,
+                )
+                return _Phase1Outcome.TRANSIENT, [], raw_html
+
+            # ── Scroll to load all virtual-scroll pages ──────────────────
+            await _scroll_until_stable(page)
+            raw_html = await page.content()
+
+            # ── Final zero-results check (banner may appear post-scroll) ─
+            if await _is_zero_results_page(page):
+                logger.info(
+                    "%s Zero-results banner detected post-scroll for query %r",
+                    mal_label,
+                    query,
+                )
+                return _Phase1Outcome.ZERO_RESULTS, [], raw_html
+
+            basic_data_list = await _extract_basic_data_all(page)
+
+            if not basic_data_list:
+                # Scrolled to stable but extracted zero cards — unexpected;
+                # treat as transient so we retry.
+                logger.warning(
+                    "%s Extraction returned 0 cards despite quiescence for query %r",
+                    mal_label,
+                    query,
+                )
+                return _Phase1Outcome.TRANSIENT, [], raw_html
+
+            return _Phase1Outcome.SUCCESS, basic_data_list, raw_html
+
+        finally:
+            await page.close()
+            await browser.close()
+
+
+# ---------------------------------------------------------------------------
+# Phase 1 — retry wrapper
+# ---------------------------------------------------------------------------
+
+
+async def _run_phase1(
+    query: str,
+    headless: bool,
+    mal_label: str,
+) -> tuple[list[BasicData], str]:
+    """
+    Run Phase 1 with retries on TRANSIENT outcomes.
+
+    ZERO_RESULTS exits immediately (no retry).
+    SUCCESS exits immediately.
+    TRANSIENT retries up to SCRAPE_MAX_ATTEMPTS times with exponential backoff.
+
+    Each attempt uses a completely fresh Playwright browser+context+page, so
+    no session state, cookies, or Algolia JS state carries over.
+
+    Returns
+    -------
+    basic_data_list : list[BasicData]  (empty on zero-results or total failure)
+    raw_html        : str
+    """
+    last_raw_html = ""
+
+    for attempt in range(1, SCRAPE_MAX_ATTEMPTS + 1):
+        logger.info(
+            "%s Phase 1 attempt %d/%d for query %r",
+            mal_label,
+            attempt,
+            SCRAPE_MAX_ATTEMPTS,
+            query,
+        )
+
+        outcome, basic_data_list, raw_html = await _phase1_attempt(
+            query, headless, mal_label
+        )
+
+        if raw_html:
+            last_raw_html = raw_html
+
+        if outcome is _Phase1Outcome.SUCCESS:
+            logger.info(
+                "%s Phase 1 succeeded on attempt %d — %d card(s)",
+                mal_label,
+                attempt,
+                len(basic_data_list),
+            )
+            return basic_data_list, raw_html
+
+        if outcome is _Phase1Outcome.ZERO_RESULTS:
+            logger.info(
+                "%s Phase 1 — genuine zero results for query %r (attempt %d)",
+                mal_label,
+                query,
+                attempt,
+            )
+            return [], raw_html
+
+        # TRANSIENT — decide whether to retry
+        if attempt >= SCRAPE_MAX_ATTEMPTS:
+            logger.error(
+                "%s Phase 1 — all %d attempts exhausted for query %r; giving up",
+                mal_label,
+                SCRAPE_MAX_ATTEMPTS,
+                query,
+            )
+            return [], last_raw_html
+
+        backoff = SCRAPE_BACKOFF_BASE_S * (2 ** (attempt - 1))
+        logger.warning(
+            "%s Phase 1 attempt %d/%d transient failure — retrying in %.1fs",
+            mal_label,
+            attempt,
+            SCRAPE_MAX_ATTEMPTS,
+            backoff,
+        )
+        await asyncio.sleep(backoff)
+
+    # Should be unreachable, but be safe.
+    return [], last_raw_html
+
+
+# ---------------------------------------------------------------------------
 # Phase 2 — portal close (guaranteed) + extraction
 # ---------------------------------------------------------------------------
 
@@ -312,17 +600,12 @@ async def _extract_basic_data_all(page: Page) -> list[BasicData]:
 async def _force_close_portal(page: Page, ctx: str = "") -> None:
     """
     Unconditionally close any open headlessui dialog.
-    Guaranteed to leave the page in a stable, portal-free state.
 
     Close priority:
-      1. Known close button: first <button> inside the dialog panel
+      1. Known close button (first <button> inside the dialog panel)
       2. Escape key
       3. Backdrop click (to the left of the panel)
-
-    Each strategy is attempted in turn and verified; if one succeeds we stop.
-    A final verification wait ensures the portal is gone before returning.
     """
-    # Strategy 1 — known close button (confirmed selector)
     close_btn = await page.query_selector(DIALOG_CLOSE_BTN_SEL)
     if close_btn:
         try:
@@ -334,14 +617,12 @@ async def _force_close_portal(page: Page, ctx: str = "") -> None:
     if not await page.query_selector(PORTAL_SEL):
         return
 
-    # Strategy 2 — Escape key
     await page.keyboard.press("Escape")
     await asyncio.sleep(PORTAL_CLOSE_S)
 
     if not await page.query_selector(PORTAL_SEL):
         return
 
-    # Strategy 3 — backdrop click (left of panel)
     panel = await page.query_selector(DIALOG_PANEL_SEL)
     if panel:
         box = await panel.bounding_box()
@@ -359,7 +640,6 @@ async def _force_close_portal(page: Page, ctx: str = "") -> None:
         )
         return
 
-    # Final: wait for portal to disappear from DOM entirely
     try:
         await page.wait_for_selector(PORTAL_SEL, state="hidden", timeout=3_000)
     except PWTimeout:
@@ -393,14 +673,7 @@ async def _extract_portal_for_card(
     ctx: str = "",
 ) -> dict | None:
     """
-    Open the info dialog for the card at *index*, extract portal data, then
-    close it.
-
-    Uses a lazy Locator (re-evaluated on each interaction) so virtual-scroll
-    rendering is triggered automatically and stale-handle errors are avoided.
-
-    The close is performed in a `finally` block so the portal is always
-    dismissed before returning — even on timeout or exception.
+    Open the info dialog for the card at *index*, extract portal data, close it.
 
     Returns:
         {}                        — info button not found on this card
@@ -408,11 +681,9 @@ async def _extract_portal_for_card(
         None                      — all retries exhausted
     """
     full_sel = f"{RESULTS_CONTAINER_SEL} {RESULT_CARD_SEL}"
-    # Locator is lazy — re-evaluates on each interaction and scrolling into
-    # view triggers virtual-scroll rendering, so index is always valid.
     card_loc = page.locator(full_sel).nth(index)
 
-    for attempt in range(1, RETRY_COUNT + 1):
+    for attempt in range(1, SCRAPE_MAX_ATTEMPTS + 1):
         portal_opened = False
         try:
             await card_loc.scroll_into_view_if_needed()
@@ -452,7 +723,11 @@ async def _extract_portal_for_card(
 
         except PWTimeout:
             logger.warning(
-                "%s Card %d — timeout attempt %d/%d", ctx, index, attempt, RETRY_COUNT
+                "%s Card %d — timeout attempt %d/%d",
+                ctx,
+                index,
+                attempt,
+                SCRAPE_MAX_ATTEMPTS,
             )
         except Exception as exc:
             logger.warning(
@@ -460,7 +735,7 @@ async def _extract_portal_for_card(
                 ctx,
                 index,
                 attempt,
-                RETRY_COUNT,
+                SCRAPE_MAX_ATTEMPTS,
                 exc,
             )
 
@@ -468,15 +743,53 @@ async def _extract_portal_for_card(
             if portal_opened or await page.query_selector(PORTAL_SEL):
                 await _force_close_portal(page, ctx=ctx)
 
-        await asyncio.sleep(RETRY_BACKOFF_S * attempt)
+        await asyncio.sleep(SCRAPE_BACKOFF_BASE_S * (2 ** (attempt - 1)))
 
     logger.error(
         "%s Card %d — all %d retries exhausted; portal_data=None",
         ctx,
         index,
-        RETRY_COUNT,
+        SCRAPE_MAX_ATTEMPTS,
     )
     return None
+
+
+# ---------------------------------------------------------------------------
+# Phase 2 wrapper — runs inside the *same* browser that Phase 1 used
+# ---------------------------------------------------------------------------
+
+
+async def _run_phase2(
+    page: Page,
+    results: list[ResultItem],
+    fetch_portal_indices: set[int],
+    mal_label: str,
+) -> None:
+    """
+    Mutates *results* in-place: sets portal_data on targeted indices.
+    """
+    targets = sorted(idx for idx in fetch_portal_indices if idx < len(results))
+    logger.info(
+        "%s Phase 2 — fetching portals for %d/%d card(s)",
+        mal_label,
+        len(targets),
+        len(results),
+    )
+
+    for idx in targets:
+        card_title = results[idx]["basic_data"].get("anime_title") or f"card {idx}"
+        logger.info(
+            "%s Portal %d/%d — card_title=%r",
+            mal_label,
+            idx + 1,
+            len(results),
+            card_title,
+        )
+        results[idx]["portal_data"] = await _extract_portal_for_card(
+            page, idx, ctx=mal_label
+        )
+
+    logger.info("%s Phase 2 complete", mal_label)
 
 
 # ---------------------------------------------------------------------------
@@ -493,52 +806,65 @@ async def scrape(
     """
     Scrape AniPlaylist for *query*.
 
-    Phase 1 is retried up to ``SCRAPE_RETRIES`` times with exponential
-    backoff when the result looks like a bad request or rate-limit (stats
-    element timed out *and* no no-results banner is present).  A genuine
-    zero-results page exits immediately without retrying.
+    Phase 1 is retried up to ``SCRAPE_MAX_ATTEMPTS`` times with exponential
+    backoff when the outcome is TRANSIENT (stats timeout with no cards and no
+    zero-results banner, or navigation failure).  Each retry launches a brand-
+    new browser process so no JS/cookie/Algolia session state bleeds over.
+
+    A genuine zero-results page exits immediately without retrying.
+
+    Phase 2 (portal extraction) runs in the same browser instance that
+    completed Phase 1, avoiding an extra page load.
 
     Parameters
     ----------
     query : str
-        Search term passed to aniplaylist.com.
     headless : bool
-        True  → headless Chromium (default).
-        False → visible browser (debugging).
     fetch_portal_indices : set[int] | None
-        When None (default) — Phase 2 is skipped entirely; portal_data is
-        absent from all ResultItems.
-        When a set — only cards at those source_index positions have their
-        portal opened and extracted.  All other cards get no portal_data key.
-        Pass an empty set to skip all portals explicitly.
+        None  — Phase 2 skipped; portal_data absent from all ResultItems.
+        set   — only cards at those source_index positions get portal extracted.
     mal_label : str
-        Optional "[MAL:id 'title']" prefix included in every log line
-        emitted during this scrape call. Pass from main.py for traceability.
+        Optional "[MAL:id 'title']" prefix for log lines.
 
     Returns
     -------
     ScrapeResult
     """
-    async with async_playwright() as pw:
-        browser: Browser = await pw.chromium.launch(headless=headless)
-        context: BrowserContext = await browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
-            viewport={"width": 1200, "height": 1200},
-        )
-        page: Page = await context.new_page()
-        raw_html_snapshot = ""
-        results: list[ResultItem] = []
+    # Phase 1: retry loop with fresh browser per attempt.
+    basic_data_list, raw_html_snapshot = await _run_phase1(query, headless, mal_label)
 
-        try:
-            # ── Phase 1 with retry-on-bad-request ────────────────────────
-            for attempt in range(1, SCRAPE_RETRIES + 1):
-                # (Re-)navigate on every attempt so stale session state is
-                # cleared before re-submitting the query.
-                last_nav_err: Exception | None = None
+    # Build ResultItems from Phase 1 data.
+    results: list[ResultItem] = [
+        ResultItem(basic_data=basic) for basic in basic_data_list
+    ]
+
+    # Phase 2: portal extraction.
+    # Runs in a fresh browser (separate from Phase 1) since Phase 1 already
+    # closed its browser.  We re-navigate to the same search so the cards are
+    # in the same positions as Phase 1 found them.
+    if fetch_portal_indices is None:
+        logger.debug("%s Phase 2 skipped — fetch_portal_indices not set", mal_label)
+    elif not results:
+        logger.debug(
+            "%s Phase 2 skipped — no Phase 1 results to open portals for", mal_label
+        )
+    else:
+        # Re-open a browser, navigate, and re-run the search so the card DOM
+        # is present for portal clicks.  We don't re-extract basic_data here —
+        # we only need the page in a state where card[idx] is clickable.
+        async with async_playwright() as pw:
+            browser: Browser = await pw.chromium.launch(headless=headless)
+            context: BrowserContext = await browser.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124.0.0.0 Safari/537.36"
+                ),
+                viewport={"width": 1200, "height": 1200},
+            )
+            page: Page = await context.new_page()
+            try:
+                last_nav_err = None
                 for base_url in BASE_URLS:
                     try:
                         await page.goto(
@@ -549,95 +875,21 @@ async def scrape(
                     except Exception as exc:
                         last_nav_err = exc
                 if last_nav_err:
-                    raise last_nav_err
-
-                stats_ok = await _type_query_and_wait(page, query)
-                await _scroll_until_stable(page)
-                raw_html_snapshot = await page.content()
-
-                # ── Genuine zero-results page → stop immediately ──────────
-                if await _is_zero_results_page(page):
-                    logger.info(
-                        "%s Zero-results banner detected for query '%s' — no retry",
-                        mal_label,
-                        query,
-                    )
-                    # basic_data_list stays empty; break out of retry loop
-                    break
-
-                basic_data_list = await _extract_basic_data_all(page)
-
-                if basic_data_list:
-                    # Got real cards — Phase 1 succeeded
-                    logger.info(
-                        "%s Phase 1 complete — %d cards (attempt %d)",
-                        mal_label,
-                        len(basic_data_list),
-                        attempt,
-                    )
-                    for basic in basic_data_list:
-                        results.append(ResultItem(basic_data=basic))
-                    break
-
-                # ── No cards and no zero-results banner ───────────────────
-                # Likely a rate-limit, transient server error, or the stats
-                # element timed out before results rendered.
-                if attempt < SCRAPE_RETRIES:
-                    backoff = SCRAPE_BACKOFF_BASE_S * (2 ** (attempt - 1))
-                    logger.warning(
-                        "%s Phase 1 attempt %d/%d — 0 cards, stats_ok=%s; "
-                        "possible rate-limit, retrying in %.1fs",
-                        mal_label,
-                        attempt,
-                        SCRAPE_RETRIES,
-                        stats_ok,
-                        backoff,
-                    )
-                    await asyncio.sleep(backoff)
-                else:
                     logger.error(
-                        "%s Phase 1 — 0 cards after %d attempts for query '%s'; "
-                        "giving up",
+                        "%s Phase 2 navigation failed: %s — portal extraction skipped",
                         mal_label,
-                        SCRAPE_RETRIES,
-                        query,
+                        last_nav_err,
                     )
-
-            # ── Phase 2 — only when indices requested ────────────────────
-            if fetch_portal_indices is None:
-                logger.debug(
-                    "%s Phase 2 skipped — fetch_portal_indices not set", mal_label
-                )
-            else:
-                targets = sorted(
-                    idx for idx in fetch_portal_indices if idx < len(results)
-                )
-                logger.info(
-                    "%s Phase 2 — fetching portals for %d/%d cards",
-                    mal_label,
-                    len(targets),
-                    len(results),
-                )
-                for idx in targets:
-                    card_title = (
-                        results[idx]["basic_data"].get("anime_title") or f"card {idx}"
-                    )
-                    logger.info(
-                        "%s Portal %d/%d — card_title='%s'",
-                        mal_label,
-                        idx + 1,
-                        len(results),
-                        card_title,
-                    )
-                    results[idx]["portal_data"] = await _extract_portal_for_card(
-                        page, idx, ctx=mal_label
-                    )
-
-                logger.info("%s Phase 2 complete", mal_label)
-
-        finally:
-            await page.close()
-            await browser.close()
+                else:
+                    await _dismiss_cookie_banner(page)
+                    await _submit_query(page, query)
+                    await _wait_for_stats_change(page, "")
+                    await _wait_for_cards_quiesce(page, query, mal_label)
+                    await _scroll_until_stable(page)
+                    await _run_phase2(page, results, fetch_portal_indices, mal_label)
+            finally:
+                await page.close()
+                await browser.close()
 
     return ScrapeResult(
         query=query,
