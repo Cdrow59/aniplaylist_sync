@@ -42,6 +42,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
+import time
 from enum import Enum, auto
 from typing import TypedDict
 
@@ -101,36 +103,137 @@ INFO_BTN_SEL = "div.cursor-pointer i"
 INFO_BTN_FALLBACK_SEL = "div.cursor-pointer"
 
 # ---------------------------------------------------------------------------
-# Timing
+# Timing  — all values deliberately "human-paced"
 # ---------------------------------------------------------------------------
 
-SCROLL_PAUSE_S = 0.7
+# Scroll: Algolia's virtual-scroll loader needs time to fire and hydrate.
+# 0.7s was causing the scraper to outrun the network requests.
+SCROLL_PAUSE_S = 1.4  # was 0.7 — give Algolia time to actually load
+
 SCROLL_MAX_ITER = 60
 SCROLL_STABLE_REPS = 3
 
 # How long to wait for the stats counter to appear after submitting a query.
-STATS_TIMEOUT_MS = 20_000
+# Algolia can be slow on cold cache; bumped from 20s → 30s.
+STATS_TIMEOUT_MS = 30_000  # was 20_000
 
-# After the stats counter updates, we additionally wait for the card list to
-# reflect the new query before we start scrolling.  This guards against the
-# Algolia race where the counter updates slightly ahead of the DOM.
-CARDS_QUIESCE_TIMEOUT_MS = 8_000
-CARDS_QUIESCE_POLL_MS = 200
+# Card quiesce: Algolia fires the stats update before the DOM is hydrated.
+# 8s was too tight on slow connections; 14s gives React time to render.
+CARDS_QUIESCE_TIMEOUT_MS = 14_000  # was 8_000
+CARDS_QUIESCE_POLL_MS = 400  # was 200 — less aggressive polling
 
-PORTAL_TIMEOUT_MS = 8_000
-PORTAL_STABLE_S = 0.4
-PORTAL_CLOSE_S = 0.4
-CARD_HOVER_S = 0.25
+# Portal dialogs: HeadlessUI transitions take ~150-300ms on real sites.
+# Previous values (0.4s) were firing the synonym scrape during the animation.
+PORTAL_TIMEOUT_MS = 12_000  # was 8_000 — more room for slow responses
+PORTAL_STABLE_S = 0.9  # was 0.4 — wait for dialog animation to finish
+PORTAL_CLOSE_S = 0.8  # was 0.4 — wait for close animation
+
+# Card hover: some cards lazy-load content on hover; 0.25s wasn't enough.
+CARD_HOVER_S = 0.6  # was 0.25
 
 # Retry policy for Phase 1.
-# Each attempt launches a completely fresh browser so no JS/cookie/session
-# state bleeds between attempts.
-#
-# Retry is triggered only on TRANSIENT outcomes (stats timeout with no cards
-# and no zero-results banner, or nav failure).  ZERO_RESULTS stops immediately.
 SCRAPE_MAX_ATTEMPTS = 4
-# Base delay in seconds before the Nth retry (doubles each time: 2 → 4 → 8).
 SCRAPE_BACKOFF_BASE_S = 4.0
+
+# ---------------------------------------------------------------------------
+# Rate limiting
+# ---------------------------------------------------------------------------
+
+# Minimum seconds between the end of one browser session and the start of the
+# next.  Prevents hammering AniPlaylist's Algolia endpoint back-to-back.
+INTER_SESSION_DELAY_MIN_S = 2.0
+INTER_SESSION_DELAY_MAX_S = 4.5
+
+# Minimum gap between opening individual portals inside Phase 2.
+# Mimics a human pausing before clicking the next card's info button.
+INTER_PORTAL_DELAY_MIN_S = 0.8
+INTER_PORTAL_DELAY_MAX_S = 2.2
+
+# Delay injected before submitting the search query, simulating a human
+# landing on the page and then typing/pasting.
+PRE_SEARCH_DELAY_MIN_S = 0.6
+PRE_SEARCH_DELAY_MAX_S = 1.8
+
+# Delay after page navigation before we start interacting with anything.
+POST_NAV_DELAY_MIN_S = 0.8
+POST_NAV_DELAY_MAX_S = 2.0
+
+# Delay after filling the search box and before pressing Enter.
+# Simulates a human glancing at what they typed before submitting.
+POST_FILL_DELAY_MIN_S = 0.5
+POST_FILL_DELAY_MAX_S = 1.4
+
+# Delay after pressing Enter — simulates a human waiting to see the page react
+# before doing anything else (e.g. scrolling, clicking).
+POST_ENTER_DELAY_MIN_S = 0.8
+POST_ENTER_DELAY_MAX_S = 1.8
+
+# Jitter added to each scroll pause so the scroll rhythm doesn't look robotic.
+# Applied as: actual_pause = SCROLL_PAUSE_S + uniform(SCROLL_JITTER_MIN_S, SCROLL_JITTER_MAX_S)
+SCROLL_JITTER_MIN_S = -0.2
+SCROLL_JITTER_MAX_S = 0.5
+SCROLL_FLOOR_S = 0.9  # absolute minimum pause per scroll step
+
+# Pause after scroll_into_view — gives the card time to fully enter the
+# viewport and trigger any lazy-load before we hover or click.
+POST_SCROLL_INTO_VIEW_MIN_S = 0.4
+POST_SCROLL_INTO_VIEW_MAX_S = 0.9
+
+# Jitter on portal close waits so close timing isn't perfectly mechanical.
+PORTAL_CLOSE_JITTER_MIN_S = 0.0
+PORTAL_CLOSE_JITTER_MAX_S = 0.4
+
+# Jitter on portal stable wait (after dialog opens, before reading content).
+PORTAL_STABLE_JITTER_MIN_S = 0.0
+PORTAL_STABLE_JITTER_MAX_S = 0.3
+
+# Jitter added to retry backoff sleeps to avoid thundering-herd on concurrent
+# workers.  Applied as: actual_backoff = base_backoff + uniform(min, max)
+RETRY_JITTER_MIN_S = 0.5
+RETRY_JITTER_MAX_S = 2.5
+
+# Track the wall-clock time the last browser session finished so we can
+# enforce INTER_SESSION_DELAY even across Phase 1 → Phase 2 boundaries.
+_last_session_end: float = 0.0
+
+
+async def _inter_session_pause(label: str = "") -> None:
+    """
+    Sleep long enough that at least INTER_SESSION_DELAY_MIN_S has elapsed
+    since the previous browser session ended, then add random extra jitter.
+
+    This is the primary rate-limit guard: it fires before every browser.launch()
+    call, including Phase 2 re-navigation, so AniPlaylist never sees two
+    Algolia search requests back-to-back.
+    """
+    global _last_session_end
+    elapsed = time.monotonic() - _last_session_end
+    base_gap = random.uniform(INTER_SESSION_DELAY_MIN_S, INTER_SESSION_DELAY_MAX_S)
+    wait = max(0.0, base_gap - elapsed)
+    if wait > 0:
+        logger.debug(
+            "%s Rate-limit pause: %.2fs (elapsed since last session: %.2fs)",
+            label,
+            wait,
+            elapsed,
+        )
+        await asyncio.sleep(wait)
+
+
+def _record_session_end() -> None:
+    global _last_session_end
+    _last_session_end = time.monotonic()
+
+
+async def _human_pause(
+    min_s: float,
+    max_s: float,
+    label: str = "",
+) -> None:
+    """Sleep for a random duration in [min_s, max_s] to mimic human timing."""
+    delay = random.uniform(min_s, max_s)
+    logger.debug("%s Human pause: %.2fs", label, delay)
+    await asyncio.sleep(delay)
 
 
 # ---------------------------------------------------------------------------
@@ -186,10 +289,13 @@ async def _dismiss_cookie_banner(page: Page) -> None:
             pass
 
 
-async def _submit_query(page: Page, query: str) -> None:
+async def _submit_query(page: Page, query: str, mal_label: str = "") -> None:
     """Fill the search box and submit; falls back to DOM injection."""
     search_box = page.locator(SEARCH_INPUT_SEL)
     await search_box.wait_for(state="visible", timeout=15_000)
+
+    # Human pause: simulate reading the page before typing
+    await _human_pause(PRE_SEARCH_DELAY_MIN_S, PRE_SEARCH_DELAY_MAX_S, mal_label)
 
     try:
         await page.wait_for_function(
@@ -198,9 +304,16 @@ async def _submit_query(page: Page, query: str) -> None:
             timeout=5_000,
         )
         await search_box.fill(query)
+        # Pause after filling — simulate a human glancing at what they typed
+        await _human_pause(POST_FILL_DELAY_MIN_S, POST_FILL_DELAY_MAX_S, mal_label)
         await search_box.press("Enter")
+        # Pause after Enter — let the page begin reacting before we do anything
+        await _human_pause(POST_ENTER_DELAY_MIN_S, POST_ENTER_DELAY_MAX_S, mal_label)
     except PWTimeout:
-        logger.debug("Search box enablement timed out — using DOM injection fallback")
+        logger.debug(
+            "%s Search box enablement timed out — using DOM injection fallback",
+            mal_label,
+        )
         await page.evaluate(
             """
             ({ selector, value }) => {
@@ -218,7 +331,7 @@ async def _submit_query(page: Page, query: str) -> None:
             """,
             {"selector": SEARCH_INPUT_SEL, "value": query},
         )
-        await asyncio.sleep(0.25)
+        await _human_pause(POST_ENTER_DELAY_MIN_S, POST_ENTER_DELAY_MAX_S, mal_label)
 
 
 async def _wait_for_stats_change(page: Page, previous_text: str) -> bool:
@@ -316,22 +429,31 @@ async def _wait_for_cards_quiesce(page: Page, query: str, mal_label: str) -> boo
     return False
 
 
-async def _scroll_until_stable(page: Page) -> None:
+async def _scroll_until_stable(page: Page, mal_label: str = "") -> None:
     full_sel = f"{RESULTS_CONTAINER_SEL} {RESULT_CARD_SEL}"
     prev_count = 0
     stable = 0
 
     for i in range(SCROLL_MAX_ITER):
         await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-        await asyncio.sleep(SCROLL_PAUSE_S)
+        # Randomise the pause so scroll rhythm doesn't look robotic
+        pause = SCROLL_PAUSE_S + random.uniform(
+            SCROLL_JITTER_MIN_S, SCROLL_JITTER_MAX_S
+        )
+        await asyncio.sleep(max(SCROLL_FLOOR_S, pause))
 
         count = await page.locator(full_sel).count()
-        logger.debug("Scroll %d — cards: %d", i, count)
+        logger.debug("%s Scroll %d — cards: %d", mal_label, i, count)
 
         if count == prev_count:
             stable += 1
             if stable >= SCROLL_STABLE_REPS:
-                logger.debug("Scroll stable at %d cards after %d steps", count, i + 1)
+                logger.debug(
+                    "%s Scroll stable at %d cards after %d steps",
+                    mal_label,
+                    count,
+                    i + 1,
+                )
                 break
         else:
             stable = 0
@@ -386,6 +508,9 @@ async def _phase1_attempt(
     basic_data_list : list[BasicData]  (non-empty only on SUCCESS)
     raw_html : str
     """
+    # Rate limit: enforce minimum gap since the last browser session closed.
+    await _inter_session_pause(mal_label)
+
     async with async_playwright() as pw:
         browser: Browser = await pw.chromium.launch(headless=headless)
         context: BrowserContext = await browser.new_context(
@@ -394,7 +519,7 @@ async def _phase1_attempt(
                 "AppleWebKit/537.36 (KHTML, like Gecko) "
                 "Chrome/124.0.0.0 Safari/537.36"
             ),
-            viewport={"width": 1200, "height": 1200},
+            viewport={"width": 1280, "height": 900},
         )
         page: Page = await context.new_page()
         raw_html = ""
@@ -405,7 +530,7 @@ async def _phase1_attempt(
             for base_url in BASE_URLS:
                 try:
                     await page.goto(
-                        base_url, wait_until="domcontentloaded", timeout=15_000
+                        base_url, wait_until="domcontentloaded", timeout=20_000
                     )
                     last_nav_err = None
                     break
@@ -414,6 +539,9 @@ async def _phase1_attempt(
             if last_nav_err:
                 logger.warning("%s Navigation failed: %s", mal_label, last_nav_err)
                 return _Phase1Outcome.TRANSIENT, [], ""
+
+            # Human pause: simulate reading the page after it loads
+            await _human_pause(POST_NAV_DELAY_MIN_S, POST_NAV_DELAY_MAX_S, mal_label)
 
             await _dismiss_cookie_banner(page)
 
@@ -424,7 +552,7 @@ async def _phase1_attempt(
             if await stats_loc.count():
                 previous_stats_text = (await stats_loc.first.inner_text()).strip()
 
-            await _submit_query(page, query)
+            await _submit_query(page, query, mal_label)
 
             # ── Wait for stats counter to reflect the new query ──────────
             stats_updated = await _wait_for_stats_change(page, previous_stats_text)
@@ -450,15 +578,9 @@ async def _phase1_attempt(
                 return _Phase1Outcome.TRANSIENT, [], raw_html
 
             # ── Wait for card DOM to reflect the new query ───────────────
-            # This is the critical guard against stale-card reads.
-            # The stats counter may update slightly before Algolia replaces
-            # the card list, so we poll until at least one rendered card is
-            # present with a non-empty title.
             cards_ready = await _wait_for_cards_quiesce(page, query, mal_label)
 
             if not cards_ready:
-                # No cards after the counter updated.  Either genuine zero
-                # results (banner not yet rendered) or a transient glitch.
                 raw_html = await page.content()
                 if await _is_zero_results_page(page):
                     logger.info(
@@ -476,7 +598,7 @@ async def _phase1_attempt(
                 return _Phase1Outcome.TRANSIENT, [], raw_html
 
             # ── Scroll to load all virtual-scroll pages ──────────────────
-            await _scroll_until_stable(page)
+            await _scroll_until_stable(page, mal_label)
             raw_html = await page.content()
 
             # ── Final zero-results check (banner may appear post-scroll) ─
@@ -491,8 +613,6 @@ async def _phase1_attempt(
             basic_data_list = await _extract_basic_data_all(page)
 
             if not basic_data_list:
-                # Scrolled to stable but extracted zero cards — unexpected;
-                # treat as transient so we retry.
                 logger.warning(
                     "%s Extraction returned 0 cards despite quiescence for query %r",
                     mal_label,
@@ -505,6 +625,7 @@ async def _phase1_attempt(
         finally:
             await page.close()
             await browser.close()
+            _record_session_end()
 
 
 # ---------------------------------------------------------------------------
@@ -579,6 +700,8 @@ async def _run_phase1(
             return [], last_raw_html
 
         backoff = SCRAPE_BACKOFF_BASE_S * (2 ** (attempt - 1))
+        # Add jitter so concurrent workers don't thunderherd on retry
+        backoff += random.uniform(RETRY_JITTER_MIN_S, RETRY_JITTER_MAX_S)
         logger.warning(
             "%s Phase 1 attempt %d/%d transient failure — retrying in %.1fs",
             mal_label,
@@ -588,7 +711,6 @@ async def _run_phase1(
         )
         await asyncio.sleep(backoff)
 
-    # Should be unreachable, but be safe.
     return [], last_raw_html
 
 
@@ -610,7 +732,10 @@ async def _force_close_portal(page: Page, ctx: str = "") -> None:
     if close_btn:
         try:
             await close_btn.click(timeout=2_000)
-            await asyncio.sleep(PORTAL_CLOSE_S)
+            await asyncio.sleep(
+                PORTAL_CLOSE_S
+                + random.uniform(PORTAL_CLOSE_JITTER_MIN_S, PORTAL_CLOSE_JITTER_MAX_S)
+            )
         except Exception:
             pass
 
@@ -618,7 +743,10 @@ async def _force_close_portal(page: Page, ctx: str = "") -> None:
         return
 
     await page.keyboard.press("Escape")
-    await asyncio.sleep(PORTAL_CLOSE_S)
+    await asyncio.sleep(
+        PORTAL_CLOSE_S
+        + random.uniform(PORTAL_CLOSE_JITTER_MIN_S, PORTAL_CLOSE_JITTER_MAX_S)
+    )
 
     if not await page.query_selector(PORTAL_SEL):
         return
@@ -631,7 +759,10 @@ async def _force_close_portal(page: Page, ctx: str = "") -> None:
                 max(0.0, box["x"] - 50),
                 box["y"] + box["height"] / 2,
             )
-            await asyncio.sleep(PORTAL_CLOSE_S)
+            await asyncio.sleep(
+                PORTAL_CLOSE_S
+                + random.uniform(PORTAL_CLOSE_JITTER_MIN_S, PORTAL_CLOSE_JITTER_MAX_S)
+            )
 
     if await page.query_selector(PORTAL_SEL):
         logger.warning(
@@ -654,7 +785,11 @@ async def _extract_synonyms(page: Page) -> tuple[list[str], str | None]:
     except PWTimeout:
         return [], "dialog panel never became visible"
 
-    await asyncio.sleep(PORTAL_STABLE_S)
+    # Wait for dialog animation to fully complete before reading content
+    await asyncio.sleep(
+        PORTAL_STABLE_S
+        + random.uniform(PORTAL_STABLE_JITTER_MIN_S, PORTAL_STABLE_JITTER_MAX_S)
+    )
 
     try:
         raw = (await page.locator(SYNONYMS_SEL).nth(0).text_content() or "").strip()
@@ -687,11 +822,16 @@ async def _extract_portal_for_card(
         portal_opened = False
         try:
             await card_loc.scroll_into_view_if_needed()
+            # Give the card time to fully enter the viewport and lazy-load
+            await _human_pause(
+                POST_SCROLL_INTO_VIEW_MIN_S, POST_SCROLL_INTO_VIEW_MAX_S, ctx
+            )
 
             try:
-                await card_loc.hover(timeout=2_000)
+                await card_loc.hover(timeout=3_000)
             except Exception:
                 pass
+            # Hold the hover long enough for any hover-triggered content to load
             await asyncio.sleep(CARD_HOVER_S)
 
             info_loc = card_loc.locator(INFO_BTN_SEL).first
@@ -743,7 +883,9 @@ async def _extract_portal_for_card(
             if portal_opened or await page.query_selector(PORTAL_SEL):
                 await _force_close_portal(page, ctx=ctx)
 
-        await asyncio.sleep(SCRAPE_BACKOFF_BASE_S * (2 ** (attempt - 1)))
+        backoff = SCRAPE_BACKOFF_BASE_S * (2 ** (attempt - 1))
+        backoff += random.uniform(RETRY_JITTER_MIN_S, RETRY_JITTER_MAX_S)
+        await asyncio.sleep(backoff)
 
     logger.error(
         "%s Card %d — all %d retries exhausted; portal_data=None",
@@ -767,6 +909,9 @@ async def _run_phase2(
 ) -> None:
     """
     Mutates *results* in-place: sets portal_data on targeted indices.
+
+    Inserts a human-paced delay between each portal extraction so the site
+    doesn't see a machine-speed sequence of dialog open/close events.
     """
     targets = sorted(idx for idx in fetch_portal_indices if idx < len(results))
     logger.info(
@@ -776,7 +921,14 @@ async def _run_phase2(
         len(results),
     )
 
-    for idx in targets:
+    for pos, idx in enumerate(targets):
+        # Inter-portal delay: pause between cards like a human reading each one.
+        # Skip before the very first card (no prior card to pause after).
+        if pos > 0:
+            await _human_pause(
+                INTER_PORTAL_DELAY_MIN_S, INTER_PORTAL_DELAY_MAX_S, mal_label
+            )
+
         card_title = results[idx]["basic_data"].get("anime_title") or f"card {idx}"
         logger.info(
             "%s Portal %d/%d — card_title=%r",
@@ -849,9 +1001,9 @@ async def scrape(
             "%s Phase 2 skipped — no Phase 1 results to open portals for", mal_label
         )
     else:
-        # Re-open a browser, navigate, and re-run the search so the card DOM
-        # is present for portal clicks.  We don't re-extract basic_data here —
-        # we only need the page in a state where card[idx] is clickable.
+        # Rate limit: enforce gap between Phase 1 session end and Phase 2 start.
+        await _inter_session_pause(mal_label)
+
         async with async_playwright() as pw:
             browser: Browser = await pw.chromium.launch(headless=headless)
             context: BrowserContext = await browser.new_context(
@@ -860,7 +1012,7 @@ async def scrape(
                     "AppleWebKit/537.36 (KHTML, like Gecko) "
                     "Chrome/124.0.0.0 Safari/537.36"
                 ),
-                viewport={"width": 1200, "height": 1200},
+                viewport={"width": 1280, "height": 900},
             )
             page: Page = await context.new_page()
             try:
@@ -868,7 +1020,7 @@ async def scrape(
                 for base_url in BASE_URLS:
                     try:
                         await page.goto(
-                            base_url, wait_until="domcontentloaded", timeout=15_000
+                            base_url, wait_until="domcontentloaded", timeout=20_000
                         )
                         last_nav_err = None
                         break
@@ -881,15 +1033,20 @@ async def scrape(
                         last_nav_err,
                     )
                 else:
+                    # Human pause after page load before interacting
+                    await _human_pause(
+                        POST_NAV_DELAY_MIN_S, POST_NAV_DELAY_MAX_S, mal_label
+                    )
                     await _dismiss_cookie_banner(page)
-                    await _submit_query(page, query)
+                    await _submit_query(page, query, mal_label)
                     await _wait_for_stats_change(page, "")
                     await _wait_for_cards_quiesce(page, query, mal_label)
-                    await _scroll_until_stable(page)
+                    await _scroll_until_stable(page, mal_label)
                     await _run_phase2(page, results, fetch_portal_indices, mal_label)
             finally:
                 await page.close()
                 await browser.close()
+                _record_session_end()
 
     return ScrapeResult(
         query=query,
