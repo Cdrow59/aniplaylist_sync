@@ -7,11 +7,13 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import logging
 from pathlib import Path
 
 from dotenv import load_dotenv
 
 from db import DB_PATH
+from logging_config import setup_logging
 
 load_dotenv(dotenv_path=Path(__file__).with_name(".env"), override=False)
 
@@ -21,7 +23,7 @@ def _make_argparser() -> argparse.ArgumentParser:
         description="Fetch a MAL user's anime titles and search each one on AniPlaylist."
     )
     parser.add_argument("--db", type=Path, default=DB_PATH, help="SQLite database path")
-    parser.add_argument("--username", default=None, help="MAL username or @me")
+    parser.add_argument("--username", default="Cdrow", help="MAL username to fetch")
     parser.add_argument("--client-id", default=None, help="MAL client ID")
     parser.add_argument("--access-token", default=None, help="MAL access token")
     parser.add_argument(
@@ -46,6 +48,12 @@ def _make_argparser() -> argparse.ArgumentParser:
         "--headed", action="store_true", help="Run Playwright in headed mode"
     )
     parser.add_argument(
+        "--confirm", action="store_true", help="Confirm running spotify"
+    )
+    parser.add_argument(
+        "--save-html", action="store_true", help="Save raw html for debugging"
+    )
+    parser.add_argument(
         "--aniplaylist-delay",
         type=float,
         default=None,
@@ -62,6 +70,19 @@ def _make_argparser() -> argparse.ArgumentParser:
         default=None,
         help="Filter MAL anime by status (complete, watching, on_hold, dropped, plan_to_watch)",
     )
+    parser.add_argument(
+        "--timeout",
+        type=float,
+        default=None,
+        help="Timeout in seconds for entire operation (default: 1800)",
+    )
+    parser.add_argument(
+        "--log-level",
+        type=str,
+        default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        help="Logging level",
+    )
     return parser
 
 
@@ -69,10 +90,24 @@ def main() -> None:
     parser = _make_argparser()
     args = parser.parse_args()
 
+    # Initialize logging with specified level
+    log_level = getattr(logging, args.log_level, logging.INFO)
+    setup_logging(level=log_level, log_file=Path("aniplaylist_sync.log"))
+
+    logger = logging.getLogger(__name__)
+    logger.debug("Parsed CLI args: %s", vars(args))
+
     # delegate to orchestrator in main.py
     import main as orchestrator
 
-    asyncio.run(orchestrator.run(args))
+    try:
+        asyncio.run(orchestrator.run(args))
+    except KeyboardInterrupt:
+        logger.info("Sync interrupted by user")
+        raise
+    except Exception as e:
+        logger.error(f"Sync failed: {e}", exc_info=True)
+        raise
 
 
 if __name__ == "__main__":

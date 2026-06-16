@@ -1,24 +1,20 @@
+"""MAL API client."""
+
 from __future__ import annotations
 
 import asyncio
 import json
-from contextlib import nullcontext
+import logging
+import random
 from dataclasses import dataclass, field
 from typing import Any
 
 import aiohttp
-from rich.progress import (
-    BarColumn,
-    MofNCompleteColumn,
-    Progress,
-    TextColumn,
-    TimeElapsedColumn,
-    TimeRemainingColumn,
-)
+from rich.progress import Progress
 
-# ---------------------------------------------------------------------------
-# Simple rate-limited session
-# ---------------------------------------------------------------------------
+logger = logging.getLogger(__name__)
+
+RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 
 
 class RateLimitedSession:
@@ -31,23 +27,17 @@ class RateLimitedSession:
     async def get(self, *args, **kwargs):
         async with self._lock:
             now = asyncio.get_running_loop().time()
-
             if self._last_request:
                 delay = (1.0 / self.per_second) - (now - self._last_request)
                 if delay > 0:
+                    logger.debug("Rate limit: sleeping %.3fs", delay)
                     await asyncio.sleep(delay)
-
             self._last_request = asyncio.get_running_loop().time()
-
         return await self._session.get(*args, **kwargs)
 
     async def close(self):
+        logger.debug("Closing MAL HTTP session")
         await self._session.close()
-
-
-# ---------------------------------------------------------------------------
-# MAL models
-# ---------------------------------------------------------------------------
 
 
 @dataclass(slots=True)
@@ -62,11 +52,6 @@ class MALAnimeEntry:
     raw: dict[str, Any] | None = None
 
 
-# ---------------------------------------------------------------------------
-# MAL client
-# ---------------------------------------------------------------------------
-
-
 @dataclass(slots=True)
 class MALClient:
     client_id: str
@@ -78,6 +63,12 @@ class MALClient:
 
     def __post_init__(self) -> None:
         self.session = RateLimitedSession(per_second=self.per_second)
+        logger.debug(
+            "MALClient initialized — user=%r  rate_limit=%.2f/s  authenticated=%s",
+            self.username,
+            self.per_second,
+            bool(self.access_token),
+        )
 
     def _headers(self) -> dict[str, str]:
         headers = {"X-MAL-CLIENT-ID": self.client_id}
@@ -86,6 +77,7 @@ class MALClient:
         return headers
 
     async def get_anime_details(self, anime_id: int) -> dict[str, Any]:
+        logger.debug("Fetching anime details for MAL ID %d", anime_id)
         url = f"{self.base_url}/anime/{anime_id}"
         return await self._get_json(
             url,
@@ -97,29 +89,93 @@ class MALClient:
         url: str,
         params: dict[str, object] | None = None,
     ) -> dict[str, Any]:
-        resp = await self.session.get(
-            url,
-            headers=self._headers(),
-            params=params,
-            timeout=aiohttp.ClientTimeout(total=30),
-        )
+        logger.debug("MAL GET %s params=%s", url, params)
 
-        if resp.status >= 400:
-            text = await resp.text()
-            raise RuntimeError(f"MAL request failed ({resp.status}): {text[:500]}")
+        last_exc = None
 
-        return json.loads(await resp.text())
+        for attempt in range(6):  # you can raise this if you want even more persistence
+            try:
+                resp = await self.session.get(
+                    url,
+                    headers=self._headers(),
+                    params=params,
+                    timeout=aiohttp.ClientTimeout(total=30),
+                )
+
+                # -------------------------
+                # RETRYABLE HTTP RESPONSES
+                # -------------------------
+                if resp.status in {429, 500, 502, 503, 504}:
+                    text = await resp.text()
+
+                    # scale delay with your rate limit
+                    base_delay = max(1.5, 6.0 / self.per_second)
+
+                    # exponential backoff (NO CAP)
+                    delay = base_delay * (3**attempt)
+
+                    # jitter (prevents sync retry waves)
+                    delay += random.uniform(base_delay * 0.5, base_delay * 1.5)
+
+                    logger.warning(
+                        "MAL retryable HTTP %d for %s (attempt %d/6), sleeping %.2fs",
+                        resp.status,
+                        url,
+                        attempt + 1,
+                        delay,
+                    )
+
+                    await asyncio.sleep(delay)
+                    last_exc = RuntimeError(f"HTTP {resp.status}: {text[:200]}")
+                    continue
+
+                # -------------------------
+                # FATAL ERRORS (NO RETRY)
+                # -------------------------
+                if resp.status >= 400:
+                    text = await resp.text()
+                    logger.error(
+                        "MAL request failed (%d) for %s: %s",
+                        resp.status,
+                        url,
+                        text[:500],
+                    )
+                    raise RuntimeError(f"MAL request failed ({resp.status})")
+
+                return json.loads(await resp.text())
+
+            except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+                base_delay = max(1.5, 6.0 / self.per_second)
+                delay = base_delay * (3**attempt)
+                delay += random.uniform(base_delay * 0.5, base_delay * 1.5)
+
+                logger.warning(
+                    "MAL network error %s (attempt %d/6), sleeping %.2fs",
+                    exc,
+                    attempt + 1,
+                    delay,
+                )
+
+                await asyncio.sleep(delay)
+                last_exc = exc
+
+        raise RuntimeError(f"MAL request failed after retries") from last_exc
 
     async def list_user_anime(
         self,
         status: str | None = None,
         *,
-        progress: Progress | None = None,
+        progress: Progress,
     ) -> list[MALAnimeEntry]:
-        user_path = self.username or "@me"
+        """Fetch the user's anime list.
 
-        url = f"{self.base_url}/users/{user_path}/animelist"
-
+        Args:
+            status: Optional MAL watch-status filter.
+            progress: A *started* Rich Progress instance owned by the caller.
+                      A task will be added and advanced; the caller retains
+                      ownership and must not stop the Progress here.
+        """
+        url = f"{self.base_url}/users/{self.username}/animelist"
         params: dict[str, object] = {
             "fields": "list_status,alternative_titles",
             "limit": 1000,
@@ -127,95 +183,60 @@ class MALClient:
         if status:
             params["status"] = status
 
-        entries: list[MALAnimeEntry] = []
-        offset = 0
-
-        progress_context = (
-            Progress(
-                TextColumn("[progress.description]{task.description}"),
-                BarColumn(),
-                MofNCompleteColumn(),
-                TimeElapsedColumn(),
-                TimeRemainingColumn(),
-            )
-            if progress is None
-            else nullcontext(progress)
+        logger.info(
+            "Fetching MAL anime list for user=%r status=%s", self.username, status
         )
 
-        with progress_context as progress:
-            assert progress is not None
+        entries: list[MALAnimeEntry] = []
+        offset = 0
+        task = progress.add_task("MAL", total=None)
+        page = 0
 
-            task = progress.add_task("MAL", total=None)
+        while True:
+            payload = await self._get_json(url, {**params, "offset": offset})
+            page += 1
+            page_entries = payload.get("data", [])
+            logger.debug(
+                "MAL list page %d (offset=%d) — %d entry(ies)",
+                page,
+                offset,
+                len(page_entries),
+            )
 
-            while True:
-                payload = await self._get_json(
-                    url,
-                    {**params, "offset": offset},
-                )
-
-                for item in payload.get("data", []):
-                    node = item.get("node", {})
-                    status = item.get("list_status", {})
-
-                    entries.append(
-                        MALAnimeEntry(
-                            mal_id=int(node.get("id")),
-                            title=str(node.get("title") or ""),
-                            alternative_titles=node.get("alternative_titles"),
-                            status=status.get("status"),
-                            score=(
-                                float(status["score"])
-                                if status.get("score") is not None
-                                else None
-                            ),
-                            num_episodes_watched=(
-                                int(status["num_episodes_watched"])
-                                if status.get("num_episodes_watched") is not None
-                                else None
-                            ),
-                            raw=item,
-                        )
+            for item in page_entries:
+                node = item.get("node", {})
+                list_status = item.get("list_status", {})
+                entries.append(
+                    MALAnimeEntry(
+                        mal_id=int(node.get("id")),
+                        title=str(node.get("title") or ""),
+                        alternative_titles=node.get("alternative_titles"),
+                        status=list_status.get("status"),
+                        score=(
+                            float(list_status["score"])
+                            if list_status.get("score") is not None
+                            else None
+                        ),
+                        num_episodes_watched=(
+                            int(list_status["num_episodes_watched"])
+                            if list_status.get("num_episodes_watched") is not None
+                            else None
+                        ),
+                        raw=item,
                     )
+                )
+                progress.advance(task)
 
-                    progress.advance(task)
+            paging = payload.get("paging", {})
+            if not paging.get("next"):
+                break
+            offset += int(params["limit"])
 
-                paging = payload.get("paging", {})
-                next_url = paging.get("next")
-
-                if not next_url:
-                    break
-
-                offset += int(params["limit"])
-
-            progress.update(task, total=len(entries))
-
+        progress.update(task, total=len(entries))
+        logger.info(
+            "Fetched %d MAL anime entry(ies) for user=%r", len(entries), self.username
+        )
         return entries
 
     async def close(self) -> None:
         await self.session.close()
-
-
-# ---------------------------------------------------------------------------
-# Example
-# ---------------------------------------------------------------------------
-
-
-async def main():
-    client = MALClient(
-        client_id="YOUR_CLIENT_ID",
-        access_token="YOUR_ACCESS_TOKEN",
-        username="@me",
-    )
-
-    try:
-        anime = await client.list_user_anime()
-        print(f"Found {len(anime)} entries")
-
-        for entry in anime[:10]:
-            print(entry.title)
-    finally:
-        await client.close()
-
-
-if __name__ == "__main__":
-    asyncio.run(main())
