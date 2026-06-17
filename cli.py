@@ -15,7 +15,7 @@ from dotenv import load_dotenv
 from db import DB_PATH
 from logging_config import setup_logging
 
-load_dotenv(dotenv_path=Path(__file__).with_name(".env"), override=False)
+load_dotenv(dotenv_path=Path(__file__).with_name(".env"), override=True)
 
 
 def _make_argparser() -> argparse.ArgumentParser:
@@ -82,6 +82,14 @@ def _make_argparser() -> argparse.ArgumentParser:
         default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         help="Logging level",
+    )
+    parser.add_argument(
+        "--cached",
+        action="store_true",
+        help=(
+            "Skip MAL fetching and AniPlaylist scraping entirely; "
+            "run the Spotify stage against existing DB data only."
+        ),
     )
     return parser
 

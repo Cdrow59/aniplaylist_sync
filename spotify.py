@@ -266,13 +266,15 @@ async def create_spotify_playlist(
         logger.warning("No tracks for %s", name)
         return
 
+    # REPLACE with:
     playlist = await asyncio.to_thread(
-        client.user_playlist_create,
-        user=user_id,
-        name=name,
-        public=False,
-        collaborative=False,
-        description="Created by aniplaylist_sync",
+        client._post,
+        "me/playlists",
+        payload={
+            "name": name,
+            "public": True,
+            "description": "Created by aniplaylist_sync",
+        },
     )
 
     pid = playlist["id"]
@@ -302,7 +304,6 @@ async def run_spotify_stage(
         redirect_uri=_read_spotify_env("SPOTIPY_REDIRECT_URI"),
         scope="playlist-modify-private playlist-modify-public",
     )
-
     client = spotipy.Spotify(auth_manager=auth)
     user_id = (await asyncio.to_thread(client.current_user))["id"]
 

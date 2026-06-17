@@ -149,15 +149,6 @@ async def _search_one(
     save_html: bool,
     allow_pass2: bool = True,
 ) -> tuple[list[SearchResult], list[dict], bool]:
-    """
-    Run one scrape+parse cycle for *title_query*.
-
-    Pass 1 — Phase 1 only (no portal clicks).
-    If exact_filter is on, no cards matched by title, and allow_pass2 is
-    True, run Pass 2 — re-scrape with portals opened only for unmatched cards.
-
-    Returns (results, attempt_log_entries, search_succeeded).
-    """
     ctx = f"[MAL:{mal_id} '{mal_title}']"
     attempt_logs: list[dict] = []
 
@@ -198,7 +189,6 @@ async def _search_one(
         }
     )
 
-    # Matched on title alone — no portal needed
     if matched or not exact_filter:
         results = matched if exact_filter else raw_results
         if results:
@@ -367,9 +357,6 @@ async def run_aniplaylist_stage(
         any_scrape_succeeded = False
         total_cards_seen = 0
 
-        # ── Loop 1: exhaust all title candidates with Pass 1 only ────────
-        # Portals are expensive — try every title variant via simple search
-        # before falling back to portal synonym checks.
         for title_query in titles_to_try:
             results, attempt_logs, succeeded = await _search_one(
                 title_query,
@@ -385,11 +372,7 @@ async def run_aniplaylist_stage(
             total_cards_seen += sum(log.get("result_count", 0) for log in attempt_logs)
 
             if not succeeded:
-                logger.warning(
-                    "%s Query '%s' failed",
-                    ctx,
-                    title_query,
-                )
+                logger.warning("%s Query '%s' failed", ctx, title_query)
                 continue
 
             any_scrape_succeeded = True
@@ -404,7 +387,6 @@ async def run_aniplaylist_stage(
                     title_query,
                 )
 
-        # ── Loop 2: if still no match, retry all candidates with portals ─
         if not results:
             logger.info(
                 "%s All Pass 1 candidates exhausted — retrying with portal synonym checks",
@@ -427,11 +409,7 @@ async def run_aniplaylist_stage(
                 )
 
                 if not succeeded:
-                    logger.warning(
-                        "%s Query '%s' failed",
-                        ctx,
-                        title_query,
-                    )
+                    logger.warning("%s Query '%s' failed", ctx, title_query)
                     continue
 
                 any_scrape_succeeded = True
@@ -456,10 +434,6 @@ async def run_aniplaylist_stage(
                 matched_count,
             )
         else:
-            # Classify precisely so the DB is queryable by cause:
-            #   scrape_error — every attempt threw before returning any cards
-            #   not_found    — scrapes succeeded but AniPlaylist had zero cards
-            #   no_match     — cards came back but none matched our titles
             if not any_scrape_succeeded:
                 failure_type = FAILURE_SCRAPE_ERROR
             elif total_cards_seen == 0:
@@ -484,8 +458,6 @@ async def run_aniplaylist_stage(
                 english_title=english_title,
                 japanese_title=japanese_title,
                 mal_status=entry.status,
-                # Skip storing attempt_log for clean not_found cases — zero
-                # cards means there's nothing useful to inspect per-attempt.
                 attempt_log=(
                     all_attempt_logs if failure_type != FAILURE_NOT_FOUND else None
                 ),
@@ -537,6 +509,46 @@ async def run(args) -> None:
 
 
 async def _run_impl(args) -> None:
+    await init_db(args.db)
+
+    # ------------------------------------------------------------------
+    # Cached mode: skip all network stages, go straight to Spotify using
+    # whatever is already in the DB.
+    # ------------------------------------------------------------------
+    if getattr(args, "cached", False):
+        logger.info("Cached mode — skipping MAL fetch and AniPlaylist scrape")
+        if args.dry_run:
+            logger.info("Dry run enabled — skipping Spotify stage")
+            return
+        with Progress(
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            MofNCompleteColumn(),
+            TimeElapsedColumn(),
+            TimeRemainingColumn(),
+        ) as progress:
+            from spotify import run_spotify_stage
+
+            if args.confirm:
+                if Confirm.ask("Run Spotify?"):
+                    await run_spotify_stage(
+                        args.db,
+                        megaplaylist=bool(args.megaplaylist),
+                        progress=progress,
+                    )
+                else:
+                    logger.info("Spotify stage skipped — user declined confirmation")
+            else:
+                await run_spotify_stage(
+                    args.db,
+                    megaplaylist=bool(args.megaplaylist),
+                    progress=progress,
+                )
+        return
+
+    # ------------------------------------------------------------------
+    # Normal mode
+    # ------------------------------------------------------------------
     client_id = args.client_id or read_env("MAL_CLIENT_ID")
     access_token = args.access_token or os.getenv("MAL_ACCESS_TOKEN")
     username = args.username or read_env("MAL_USERNAME", "@me")
@@ -547,8 +559,6 @@ async def _run_impl(args) -> None:
         else float(read_env("ANIPLAYLIST_DELAY_SECONDS", "1"))
     )
     mal_status = normalize_status(args.status) if args.status else None
-
-    await init_db(args.db)
 
     client = MALClient(
         client_id=client_id,
