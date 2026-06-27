@@ -43,10 +43,14 @@ from __future__ import annotations
 import asyncio
 import logging
 from typing import TypedDict
+from urllib.parse import quote
 
 from playwright.async_api import (
     Browser,
     BrowserContext,
+)
+from playwright.async_api import Error as PWError
+from playwright.async_api import (
     Page,
 )
 from playwright.async_api import TimeoutError as PWTimeout
@@ -93,8 +97,8 @@ PORTAL_SEL = "div[data-headlessui-state='open']"
 DIALOG_PANEL_SEL = "div[id^='headlessui-dialog-panel-']"
 DIALOG_CLOSE_BTN_SEL = "div[id^='headlessui-dialog-panel-'] > button"
 SYNONYMS_SEL = "div[id^='headlessui-dialog-panel-'] span.text-xs.italic"
-INFO_BTN_SEL = "div.cursor-pointer i"
-INFO_BTN_FALLBACK_SEL = "div.cursor-pointer"
+INFO_BTN_SEL = "div.absolute.inset-0.cursor-pointer[tabindex='0'] span.absolute"
+INFO_BTN_FALLBACK_SEL = "div.absolute.inset-0.cursor-pointer[tabindex='0']"
 
 # ---------------------------------------------------------------------------
 # Timing
@@ -191,6 +195,7 @@ async def _type_query_and_wait(page: Page, query: str) -> None:
         )
         await asyncio.sleep(0.25)
 
+    # Wait for stats to reflect the new query
     try:
         await page.wait_for_function(
             r"""
@@ -211,13 +216,41 @@ async def _type_query_and_wait(page: Page, query: str) -> None:
         )
     except PWTimeout:
         logger.debug("Stats timeout for '%s' — continuing with partial results", query)
+        return
+
+    # Wait for DOM cards to be consistent with the new stats count.
+    # 0 stats → wait until 0 cards (old cards flushed).
+    # >0 stats → wait until at least 1 card is present and count <= expected
+    #            (guards against reading a stale prior result set).
+    try:
+        full_card_sel = f"{RESULTS_CONTAINER_SEL} {RESULT_CARD_SEL}"
+        await page.wait_for_function(
+            r"""
+            ({ statsSel, cardSel }) => {
+                const statsEl = document.querySelector(statsSel);
+                if (!statsEl) return false;
+                const match = statsEl.textContent.match(/(\d+)/);
+                if (!match) return false;
+                const expected = parseInt(match[1], 10);
+                const actual = document.querySelectorAll(cardSel).length;
+                if (expected === 0) return actual === 0;
+                return actual > 0 && actual <= expected;
+            }
+            """,
+            arg={"statsSel": RESULTS_STATS_SEL, "cardSel": full_card_sel},
+            timeout=STATS_TIMEOUT_MS,
+        )
+        logger.debug("Results settled for '%s'", query)
+    except PWTimeout:
+        logger.debug(
+            "Result-settle timeout for '%s' — continuing with whatever is in DOM", query
+        )
 
 
 async def _scroll_until_stable(page: Page) -> list[BasicData]:
     full_sel = f"{RESULTS_CONTAINER_SEL} {RESULT_CARD_SEL}"
 
-    seen: dict[str, BasicData] = {}
-
+    seen: dict[tuple, BasicData] = {}
     stable = 0
     previous_count = 0
 
@@ -269,7 +302,6 @@ async def _scroll_until_stable(page: Page) -> list[BasicData]:
                 source_index=len(seen),
             )
 
-            # stable unique key
             key = (
                 item["anime_title"],
                 item["title_raw"],
@@ -286,7 +318,6 @@ async def _scroll_until_stable(page: Page) -> list[BasicData]:
         )
 
         await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-
         await asyncio.sleep(SCROLL_PAUSE_S)
 
         if len(seen) == previous_count:
@@ -431,7 +462,8 @@ async def _extract_portal_for_card(
                 logger.debug("%s Card %d — no info button found", ctx, index)
                 return {}
 
-            await info_loc.click(force=True)
+            await info_loc.scroll_into_view_if_needed()
+            await info_loc.click(timeout=2_000)
             await page.wait_for_selector(
                 PORTAL_SEL, state="visible", timeout=PORTAL_TIMEOUT_MS
             )
@@ -515,6 +547,7 @@ async def scrape(
     -------
     ScrapeResult
     """
+
     async with async_playwright() as pw:
         browser: Browser = await pw.chromium.launch(headless=headless)
         context: BrowserContext = await browser.new_context(
@@ -531,12 +564,17 @@ async def scrape(
 
         try:
             # ── Phase 1 ──────────────────────────────────────────────────
+            # Navigate directly to the search URL so results are scoped to
+            # this query from page load — no stale-card race from typing
+            # into the search box on the homepage.
+            search_url = f"https://aniplaylist.com/{quote(query, safe='')}"
             last_err: Exception | None = None
-            for base_url in BASE_URLS:
+            for url in (
+                search_url,
+                f"https://www.aniplaylist.com/{quote(query, safe='')}",
+            ):
                 try:
-                    await page.goto(
-                        base_url, wait_until="domcontentloaded", timeout=15_000
-                    )
+                    await page.goto(url, wait_until="domcontentloaded", timeout=15_000)
                     last_err = None
                     break
                 except Exception as exc:
@@ -544,7 +582,30 @@ async def scrape(
             if last_err:
                 raise last_err
 
-            await _type_query_and_wait(page, query)
+            # Wait for stats to appear and cards to settle
+            try:
+                await page.wait_for_function(
+                    r"""
+                    ({ statsSel, cardSel }) => {
+                        const statsEl = document.querySelector(statsSel);
+                        if (!statsEl) return false;
+                        const match = statsEl.textContent.match(/(\d+)/);
+                        if (!match) return false;
+                        const expected = parseInt(match[1], 10);
+                        if (expected === 0) return true;
+                        return document.querySelectorAll(cardSel).length > 0;
+                    }
+                    """,
+                    arg={
+                        "statsSel": RESULTS_STATS_SEL,
+                        "cardSel": f"{RESULTS_CONTAINER_SEL} {RESULT_CARD_SEL}",
+                    },
+                    timeout=STATS_TIMEOUT_MS,
+                )
+            except PWTimeout:
+                logger.debug(
+                    "%s Stats/card timeout for '%s' — continuing", mal_label, query
+                )
 
             raw_html_snapshot = await page.content()
 
@@ -589,8 +650,14 @@ async def scrape(
                 logger.info("%s Phase 2 complete", mal_label)
 
         finally:
-            await page.close()
-            await browser.close()
+            try:
+                await page.close()
+            except PWError as e:
+                logger.error("Encountered Playwright error during page close: %s", e)
+            try:
+                await browser.close()
+            except PWError as e:
+                logger.error("Encountered Playwright error during browser close: %s", e)
 
     return ScrapeResult(
         query=query,

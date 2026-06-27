@@ -42,6 +42,45 @@ def _read_spotify_env(name: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# RATE LIMITER
+# ---------------------------------------------------------------------------
+
+
+class RateLimitedSpotifyClient:
+    """Wraps a spotipy.Spotify instance with per-second rate limiting."""
+
+    def __init__(self, client: Any, per_second: float = 5.0):
+        self._client = client
+        self._per_second = per_second
+        self._lock = asyncio.Lock()
+        self._last_request: float = 0.0
+
+    async def _call(self, fn, *args, **kwargs):
+        async with self._lock:
+            now = asyncio.get_running_loop().time()
+            delay = (1.0 / self._per_second) - (now - self._last_request)
+            if delay > 0:
+                logger.debug("Spotify rate limit: sleeping %.3fs", delay)
+                await asyncio.sleep(delay)
+            self._last_request = asyncio.get_running_loop().time()
+        return await asyncio.to_thread(fn, *args, **kwargs)
+
+    async def current_user(self):
+        return await self._call(self._client.current_user)
+
+    async def post_playlist(self, payload: dict) -> dict:
+        return await self._call(self._client._post, "me/playlists", payload=payload)
+
+    async def playlist_add_items(self, pid: str, uris: list[str]):
+        return await self._call(self._client.playlist_add_items, pid, uris)
+
+    async def album_tracks(self, rid: str, limit: int, offset: int) -> dict:
+        return await self._call(
+            self._client.album_tracks, rid, limit=limit, offset=offset
+        )
+
+
+# ---------------------------------------------------------------------------
 # SPOTIFY LINK PARSING
 # ---------------------------------------------------------------------------
 
@@ -112,7 +151,7 @@ def _safe_seq(seq: int | None) -> int:
 
 
 # ---------------------------------------------------------------------------
-# DB FETCH (IMPORTANT: NOW INCLUDES mal_id)
+# DB FETCH
 # ---------------------------------------------------------------------------
 
 
@@ -196,7 +235,9 @@ async def fetch_series_playlist_sources(db_path: Path):
 # ---------------------------------------------------------------------------
 
 
-async def resolve_spotify_link_to_track_uris(client: Any, link: str) -> list[str]:
+async def resolve_spotify_link_to_track_uris(
+    client: RateLimitedSpotifyClient, link: str
+) -> list[str]:
     kind, rid = spotify_link_kind_and_id(link)
     if not kind or not rid:
         return []
@@ -210,9 +251,7 @@ async def resolve_spotify_link_to_track_uris(client: Any, link: str) -> list[str
             out = []
             offset = 0
             while True:
-                page = await asyncio.to_thread(
-                    client.album_tracks, rid, limit=50, offset=offset
-                )
+                page = await client.album_tracks(rid, limit=50, offset=offset)
                 for item in page.get("items", []):
                     uri = item.get("uri")
                     if uri:
@@ -233,7 +272,7 @@ async def resolve_spotify_link_to_track_uris(client: Any, link: str) -> list[str
 
 
 async def create_spotify_playlist(
-    client: Any,
+    client: RateLimitedSpotifyClient,
     user_id: str,
     name: str,
     entries: list[tuple[int, str, str, int | None]],
@@ -258,29 +297,23 @@ async def create_spotify_playlist(
         logger.warning("No tracks for %s", name)
         return
 
-    # ----------------------------
-    # CREATE PLAYLIST CHUNKS
-    # ----------------------------
     chunks = list(_chunked(uris, SPOTIFY_PLAYLIST_LIMIT))
 
     for idx, chunk in enumerate(chunks, start=1):
         playlist_name = name if len(chunks) == 1 else f"{name} (Part {idx})"
 
-        playlist = await asyncio.to_thread(
-            client._post,
-            "me/playlists",
-            payload={
+        playlist = await client.post_playlist(
+            {
                 "name": playlist_name,
                 "public": True,
                 "description": "Created by aniplaylist_sync",
-            },
+            }
         )
 
         pid = playlist["id"]
 
-        # Spotify max is 100 per request
         for batch in _chunked(chunk, 100):
-            await asyncio.to_thread(client.playlist_add_items, pid, batch)
+            await client.playlist_add_items(pid, batch)
 
         logger.info(
             "Created playlist %s with %d tracks",
@@ -310,8 +343,11 @@ async def run_spotify_stage(
         redirect_uri=_read_spotify_env("SPOTIPY_REDIRECT_URI"),
         scope="playlist-modify-private playlist-modify-public",
     )
-    client = spotipy.Spotify(auth_manager=auth)
-    user_id = (await asyncio.to_thread(client.current_user))["id"]
+    per_second = float(os.getenv("SPOTIFY_RATE_LIMIT_PER_SECOND", "5"))
+    client = RateLimitedSpotifyClient(
+        spotipy.Spotify(auth_manager=auth), per_second=per_second
+    )
+    user_id = (await client.current_user())["id"]
 
     if megaplaylist:
         sources = [("AniPlaylist Megaplaylist", await fetch_result_links(db_path))]
