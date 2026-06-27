@@ -10,7 +10,7 @@ import unicodedata
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Protocol
 
 import aiohttp
 import aiosqlite
@@ -18,6 +18,10 @@ import networkx as nx
 from rich.progress import Progress
 
 from mal import MALClient
+
+
+class HasAnimeDetails(Protocol):
+    async def get_anime_details(self, anime_id: int) -> dict[str, Any]: ...
 
 logger = logging.getLogger(__name__)
 
@@ -133,7 +137,7 @@ def _series_name_for_component(
 
 
 async def discover_series(
-    client: MALClient,
+    client: HasAnimeDetails,
     seed_ids: Iterable[int],
     *,
     progress: Progress,

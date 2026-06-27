@@ -57,6 +57,7 @@ class MALClient:
     client_id: str
     username: str
     access_token: str | None = None
+    redirect_uri: str | None = None
     base_url: str = "https://api.myanimelist.net/v2"
     per_second: float = 1.0
     session: RateLimitedSession = field(init=False, repr=False)

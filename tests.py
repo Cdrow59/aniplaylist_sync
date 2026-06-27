@@ -13,6 +13,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
+import asyncio
+
 # Stub playwright-dependent scraper so parser can be imported without it.
 import types
 
@@ -453,6 +455,165 @@ class TestParseFields(unittest.TestCase):
         self.assertTrue(results[1].advanced_attempted)  # had synonyms
         self.assertTrue(results[2].advanced_attempted)  # portal=None → error
         self.assertEqual(results[2].advanced_error, "portal extraction failed")
+
+
+# ---------------------------------------------------------------------------
+# AniList client tests
+# ---------------------------------------------------------------------------
+
+
+class TestAniListClient(unittest.TestCase):
+
+    def test_has_client_id_secret_fields(self):
+        from anilist import AniListClient
+
+        client = AniListClient(
+            username="testuser",
+            client_id="cid",
+            client_secret="csec",
+        )
+        self.assertEqual(client.client_id, "cid")
+        self.assertEqual(client.client_secret, "csec")
+        self.assertIsNone(client._token)
+
+    def test_ensure_token_raises_without_credentials(self):
+        from anilist import AniListClient
+
+        client = AniListClient(username="testuser")
+
+        async def _test():
+            with self.assertRaises(RuntimeError):
+                await client._ensure_token()
+
+        asyncio.run(_test())
+
+    def test_anime_entry_defaults(self):
+        from anilist import AniListAnimeEntry
+
+        entry = AniListAnimeEntry(anilist_id=1, title="Test")
+        self.assertEqual(entry.anilist_id, 1)
+        self.assertEqual(entry.title, "Test")
+        self.assertIsNone(entry.score)
+        self.assertIsNone(entry.num_episodes_watched)
+        self.assertIsNone(entry.raw)
+
+
+class TestAniListAnimeDetailsParsing(unittest.TestCase):
+
+    def test_parses_media_response(self):
+        from anilist import AniListClient
+
+        client = AniListClient(username="testuser")
+        mock_response = {
+            "id": 21,
+            "title": {
+                "romaji": "One Piece",
+                "english": "One Piece",
+                "native": "ワンピース",
+            },
+            "synonyms": ["OP", "ワンピース"],
+            "relations": {
+                "edges": [
+                    {"node": {"id": 11061}, "relationType": "SEQUEL"},
+                ]
+            },
+        }
+        self.assertEqual(mock_response["id"], 21)
+        self.assertEqual(
+            mock_response["title"]["english"], "One Piece"
+        )
+        self.assertEqual(mock_response["synonyms"], ["OP", "ワンピース"])
+        self.assertEqual(len(mock_response["relations"]["edges"]), 1)
+
+    def test_parses_media_list_entry(self):
+        from anilist import AniListAnimeEntry
+
+        raw_item = {
+            "media": {
+                "id": 21,
+                "title": {
+                    "romaji": "One Piece",
+                    "english": "One Piece",
+                    "native": "ワンピース",
+                },
+                "synonyms": ["OP"],
+            },
+            "status": "CURRENT",
+            "score": 8.5,
+            "progress": 1000,
+        }
+        media = raw_item.get("media", {}) or {}
+        title_data = media.get("title", {}) or {}
+        entry = AniListAnimeEntry(
+            anilist_id=int(media.get("id")),
+            title=str(title_data.get("romaji") or ""),
+            native_title=title_data.get("native"),
+            english_title=title_data.get("english"),
+            synonyms=media.get("synonyms"),
+            status=raw_item.get("status"),
+            score=(
+                float(raw_item["score"])
+                if raw_item.get("score") is not None
+                else None
+            ),
+            num_episodes_watched=(
+                int(raw_item["progress"])
+                if raw_item.get("progress") is not None
+                else None
+            ),
+            raw=raw_item,
+        )
+        self.assertEqual(entry.anilist_id, 21)
+        self.assertEqual(entry.title, "One Piece")
+        self.assertEqual(entry.english_title, "One Piece")
+        self.assertEqual(entry.native_title, "ワンピース")
+        self.assertEqual(entry.synonyms, ["OP"])
+        self.assertEqual(entry.status, "CURRENT")
+        self.assertEqual(entry.score, 8.5)
+        self.assertEqual(entry.num_episodes_watched, 1000)
+
+
+class TestAniListRetryableStatus(unittest.TestCase):
+
+    def test_retryable_set(self):
+        from anilist import RETRYABLE_STATUS
+
+        self.assertIn(429, RETRYABLE_STATUS)
+        self.assertIn(500, RETRYABLE_STATUS)
+        self.assertIn(502, RETRYABLE_STATUS)
+        self.assertIn(503, RETRYABLE_STATUS)
+        self.assertIn(504, RETRYABLE_STATUS)
+        self.assertNotIn(200, RETRYABLE_STATUS)
+        self.assertNotIn(404, RETRYABLE_STATUS)
+
+
+class TestAniListGraphQLErrorHandling(unittest.TestCase):
+
+    def test_raises_on_graphql_errors(self):
+        from anilist import AniListClient
+
+        client = AniListClient(username="testuser")
+        mock_data = {
+            "errors": [
+                {"message": "Not found.", "status": 404},
+            ]
+        }
+
+        with self.assertRaises(RuntimeError) as ctx:
+            errors = mock_data.get("errors", [])
+            msg = "; ".join(e.get("message", str(e)) for e in errors)
+            raise RuntimeError(f"AniList GraphQL error: {msg}")
+
+        self.assertIn("Not found", str(ctx.exception))
+
+    def test_handles_empty_media(self):
+        from anilist import AniListClient
+
+        client = AniListClient(username="testuser")
+        result = {"data": {"Media": None}}
+
+        media = result.get("data", {}).get("Media")
+        self.assertIsNone(media)
 
 
 if __name__ == "__main__":

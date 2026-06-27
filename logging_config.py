@@ -7,7 +7,10 @@ import logging
 import sys
 from pathlib import Path
 
+from rich.console import Console
 from rich.logging import RichHandler
+
+console = Console()
 
 
 def _handle_uncaught_exception(
@@ -58,6 +61,7 @@ def setup_logging(level: int = logging.INFO, log_file: Path | None = None) -> No
 
     # Rich console handler (pretty terminal output)
     console_handler = RichHandler(
+        console=console,
         rich_tracebacks=True,
         show_time=True,
     )

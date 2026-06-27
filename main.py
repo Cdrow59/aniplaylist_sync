@@ -21,6 +21,7 @@ from rich.progress import (
 )
 from rich.prompt import Confirm, Prompt
 
+from anilist import AniListClient
 from db import (
     DB_PATH,
     FAILURE_NO_MATCH,
@@ -30,6 +31,7 @@ from db import (
     save_failure,
     save_run,
 )
+from logging_config import console
 from mal import MALAnimeEntry, MALClient
 from scraper import scrape
 from series import discover_series, save_series_clusters
@@ -44,6 +46,15 @@ MAL_STATUS_ALIASES = {
     "on_hold": "on_hold",
     "dropped": "dropped",
     "plan_to_watch": "plan_to_watch",
+}
+
+ANILIST_STATUS_MAP = {
+    "completed": "COMPLETED",
+    "complete": "COMPLETED",
+    "watching": "CURRENT",
+    "on_hold": "PAUSED",
+    "dropped": "DROPPED",
+    "plan_to_watch": "PLANNING",
 }
 
 
@@ -496,8 +507,12 @@ async def run_aniplaylist_stage(
 
 
 async def run(args) -> None:
-    timeout_seconds = getattr(args, "timeout", None) or None
-    logger.info(f"Starting sync with timeout of {timeout_seconds}s")
+    timeout_seconds = args.timeout or None
+    logger.info(
+        f"Starting sync with timeout of {timeout_seconds}s"
+        if timeout_seconds
+        else f"Starting sync without timeout."
+    )
     try:
         async with asyncio.timeout(timeout_seconds):
             await _run_impl(args)
@@ -508,146 +523,199 @@ async def run(args) -> None:
         logger.info("Sync completed successfully")
 
 
-async def _run_impl(args) -> None:
-    await init_db(args.db)
+def create_progress() -> Progress:
+    return Progress(
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        MofNCompleteColumn(),
+        TimeElapsedColumn(),
+        TimeRemainingColumn(),
+        console=console,
+    )
 
-    # ------------------------------------------------------------------
-    # Cached mode: skip all network stages, go straight to Spotify using
-    # whatever is already in the DB.
-    # ------------------------------------------------------------------
-    if getattr(args, "cached", False):
-        logger.info("Cached mode — skipping MAL fetch and AniPlaylist scrape")
-        if args.dry_run:
-            logger.info("Dry run enabled — skipping Spotify stage")
-            return
-        with Progress(
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            MofNCompleteColumn(),
-            TimeElapsedColumn(),
-            TimeRemainingColumn(),
-        ) as progress:
-            from spotify import run_spotify_stage
 
-            if args.confirm:
-                if Confirm.ask("Run Spotify?"):
-                    await run_spotify_stage(
-                        args.db,
-                        megaplaylist=bool(args.megaplaylist),
-                        progress=progress,
-                    )
-                else:
-                    logger.info("Spotify stage skipped — user declined confirmation")
-            else:
-                await run_spotify_stage(
-                    args.db,
-                    megaplaylist=bool(args.megaplaylist),
-                    progress=progress,
-                )
+async def run_spotify_stage_if_needed(
+    args,
+    progress: Progress,
+) -> None:
+    if args.dry_run:
+        logger.info("Dry run enabled — skipping Spotify stage")
         return
 
-    # ------------------------------------------------------------------
-    # Normal mode
-    # ------------------------------------------------------------------
-    client_id = args.client_id or read_env("MAL_CLIENT_ID")
-    access_token = args.access_token or os.getenv("MAL_ACCESS_TOKEN")
-    username = args.username or read_env("MAL_USERNAME", "@me")
-    rate_limit = float(read_env("MAL_RATE_LIMIT_PER_SECOND", "1"))
-    aniplaylist_delay = (
-        args.aniplaylist_delay
-        if args.aniplaylist_delay is not None
-        else float(read_env("ANIPLAYLIST_DELAY_SECONDS", "1"))
+    from spotify import run_spotify_stage
+
+    if args.confirm:
+        if not Confirm.ask("\nRun Spotify?", console=console):
+            logger.info("Spotify stage skipped — user declined confirmation")
+            return
+
+    await run_spotify_stage(
+        args.db,
+        megaplaylist=bool(args.megaplaylist),
+        progress=progress,
     )
-    mal_status = normalize_status(args.status) if args.status else None
+
+
+async def run_cached_mode(args) -> None:
+    logger.info("Cached mode — skipping MAL fetch and AniPlaylist scrape")
+
+    with create_progress() as progress:
+        await run_spotify_stage_if_needed(
+            args,
+            progress,
+        )
+
+
+def create_client(args) -> tuple[
+    MALClient | AniListClient,
+    str,
+    str | None,
+]:
+    if args.anilist:
+        client = AniListClient(
+            username=args.username,
+            client_id=read_env("ANILIST_CLIENT_ID"),
+            client_secret=read_env("ANILIST_CLIENT_SECRET"),
+            redirect_uri=os.getenv("ANILIST_REDIRECT_URI"),
+            per_second=float(read_env("ANILIST_RATE_LIMIT_PER_SECOND", "5")),
+        )
+
+        status = (
+            ANILIST_STATUS_MAP.get(normalize_status(args.status))
+            if args.status
+            else None
+        )
+
+        return client, "AniList", status
 
     client = MALClient(
-        client_id=client_id,
-        access_token=access_token,
-        username=username,
-        per_second=rate_limit,
+        client_id=read_env("MAL_CLIENT_ID"),
+        username=args.username or "@me",
+        redirect_uri=os.getenv("MAL_REDIRECT_URI"),
+        per_second=float(read_env("MAL_RATE_LIMIT_PER_SECOND", "5")),
     )
 
-    try:
-        summary: list[dict[str, object]] = []
+    status = normalize_status(args.status) if args.status else None
 
-        with Progress(
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            MofNCompleteColumn(),
-            TimeElapsedColumn(),
-            TimeRemainingColumn(),
-        ) as progress:
-            mal_entries = await client.list_user_anime(
-                status=mal_status,
+    return client, "MAL", status
+
+
+async def run_main_pipeline(args) -> list[dict[str, object]]:
+    client, source_label, status = create_client(args)
+
+    try:
+        with create_progress() as progress:
+            entries = await client.list_user_anime(
+                status=status,
                 progress=progress,
             )
 
             if args.limit and args.limit > 0:
                 logger.info(
-                    "Limiting MAL entries from %d to %d per --limit",
-                    len(mal_entries),
+                    "Limiting %s entries from %d to %d",
+                    source_label,
+                    len(entries),
                     args.limit,
                 )
-                mal_entries = mal_entries[: args.limit]
+                entries = entries[: args.limit]
 
-            if not mal_entries:
-                logger.error("No MAL anime entries found!!")
-                return
+            if not entries:
+                logger.error(
+                    "No %s anime entries found!!",
+                    source_label,
+                )
+                return []
 
-            logger.info("Proceeding with %d MAL entry(ies)", len(mal_entries))
+            logger.info(
+                "Proceeding with %d %s entries",
+                len(entries),
+                source_label,
+            )
+
+            delay = (
+                args.aniplaylist_delay
+                if args.aniplaylist_delay is not None
+                else float(
+                    read_env(
+                        "ANIPLAYLIST_DELAY_SECONDS",
+                        "60",
+                    )
+                )
+            )
 
             series_task = asyncio.create_task(
-                run_series_stage(args.db, client, mal_entries, progress=progress)
+                run_series_stage(
+                    args.db,
+                    client,
+                    entries,
+                    progress=progress,
+                )
             )
+
             aniplaylist_task = asyncio.create_task(
                 run_aniplaylist_stage(
                     args.db,
-                    mal_entries,
+                    entries,
                     headed=args.headed,
                     exact_filter=not args.no_exact_filter,
-                    aniplaylist_delay=aniplaylist_delay,
+                    aniplaylist_delay=delay,
                     emit_json=args.json,
-                    progress=progress,
                     save_html=args.save_html,
+                    progress=progress,
                 )
             )
 
-            summary, _ = await asyncio.gather(aniplaylist_task, series_task)
+            summary, _ = await asyncio.gather(
+                aniplaylist_task,
+                series_task,
+            )
 
-            matched_total = sum(1 for s in summary if s.get("matched"))
             logger.info(
-                "AniPlaylist stage complete — %d/%d title(s) matched",
-                matched_total,
+                "AniPlaylist stage complete — %d/%d matched",
+                sum(1 for item in summary if item.get("matched")),
                 len(summary),
             )
 
-            if not args.dry_run:
-                from spotify import run_spotify_stage
+            return summary
 
-                if args.confirm:
-                    if Confirm.ask("Run Spotify?"):
-                        await run_spotify_stage(
-                            args.db,
-                            megaplaylist=bool(args.megaplaylist),
-                            progress=progress,
-                        )
-                    else:
-                        logger.info(
-                            "Spotify stage skipped — user declined confirmation"
-                        )
-                else:
-                    await run_spotify_stage(
-                        args.db,
-                        megaplaylist=bool(args.megaplaylist),
-                        progress=progress,
-                    )
-            else:
-                logger.info("Dry run enabled — skipping Spotify stage")
     finally:
         try:
             await client.close()
-        except Exception as e:
-            logger.warning(f"Error closing MAL client: {e}")
+        except Exception as exc:
+            logger.warning(
+                "Error closing %s client: %s",
+                source_label,
+                exc,
+            )
 
+
+async def _run_impl(args) -> None:
+    await init_db(args.db)
+
+    if getattr(args, "cached", False):
+        await run_cached_mode(args)
+        return
+
+    summary = await run_main_pipeline(args)
+
+    # Progress context is fully DEAD here
     if args.json:
         print(json.dumps(summary, ensure_ascii=False, indent=2))
+
+    if args.dry_run:
+        logger.info("Dry run enabled — skipping Spotify stage")
+        return
+
+    if args.confirm:
+        if not Confirm.ask("Run Spotify?", console=console):
+            logger.info("Spotify stage skipped — user declined confirmation")
+            return
+
+    with create_progress() as progress:
+        from spotify import run_spotify_stage
+
+        await run_spotify_stage(
+            args.db,
+            megaplaylist=bool(args.megaplaylist),
+            progress=progress,
+        )

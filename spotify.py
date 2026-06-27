@@ -15,7 +15,7 @@ from rich.progress import Progress
 
 logger = logging.getLogger(__name__)
 
-
+SPOTIFY_PLAYLIST_LIMIT = 9999
 # ---------------------------------------------------------------------------
 # ENV
 # ---------------------------------------------------------------------------
@@ -238,25 +238,17 @@ async def create_spotify_playlist(
     name: str,
     entries: list[tuple[int, str, str, int | None]],
 ) -> None:
-    """
-    entries:
-        (mal_id, spotify_link, song_type, sequence)
-    """
 
-    # ---------------------------
-    # HIERARCHICAL SORT
-    # ---------------------------
     sorted_entries = sorted(
         entries,
         key=lambda x: (
-            x[0],  # anime (mal_id)
-            _media_priority(x[2]),  # OP/ED/OST/OTHER
-            _safe_seq(x[3]),  # sequence within type
+            x[0],
+            _media_priority(x[2]),
+            _safe_seq(x[3]),
         ),
     )
 
     resolved: list[str] = []
-
     for _mal_id, link, _type, _seq in sorted_entries:
         resolved.extend(await resolve_spotify_link_to_track_uris(client, link))
 
@@ -266,21 +258,35 @@ async def create_spotify_playlist(
         logger.warning("No tracks for %s", name)
         return
 
-    # REPLACE with:
-    playlist = await asyncio.to_thread(
-        client._post,
-        "me/playlists",
-        payload={
-            "name": name,
-            "public": True,
-            "description": "Created by aniplaylist_sync",
-        },
-    )
+    # ----------------------------
+    # CREATE PLAYLIST CHUNKS
+    # ----------------------------
+    chunks = list(_chunked(uris, SPOTIFY_PLAYLIST_LIMIT))
 
-    pid = playlist["id"]
+    for idx, chunk in enumerate(chunks, start=1):
+        playlist_name = name if len(chunks) == 1 else f"{name} (Part {idx})"
 
-    for batch in _chunked(uris, 100):
-        await asyncio.to_thread(client.playlist_add_items, pid, batch)
+        playlist = await asyncio.to_thread(
+            client._post,
+            "me/playlists",
+            payload={
+                "name": playlist_name,
+                "public": True,
+                "description": "Created by aniplaylist_sync",
+            },
+        )
+
+        pid = playlist["id"]
+
+        # Spotify max is 100 per request
+        for batch in _chunked(chunk, 100):
+            await asyncio.to_thread(client.playlist_add_items, pid, batch)
+
+        logger.info(
+            "Created playlist %s with %d tracks",
+            playlist_name,
+            len(chunk),
+        )
 
 
 # ---------------------------------------------------------------------------
