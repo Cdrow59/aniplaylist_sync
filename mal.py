@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import random
 from dataclasses import dataclass, field
 from typing import Any
@@ -65,6 +66,29 @@ class MALClient:
             self.username,
             self.per_second,
             bool(self.access_token),
+        )
+
+    @classmethod
+    def from_env(cls, username: str | None = None, **kwargs) -> "MALClient":
+        """Create a MALClient from environment variables.
+
+        Reads ``MAL_CLIENT_ID``, ``MAL_USERNAME`` (overridden by *username*),
+        and optionally ``MAL_REDIRECT_URI`` / ``MAL_RATE_LIMIT_PER_SECOND``.
+        Raises ``RuntimeError`` if required variables are missing.
+        """
+        client_id = os.getenv("MAL_CLIENT_ID", "").strip()
+        if not client_id:
+            raise RuntimeError("Missing required environment variable: MAL_CLIENT_ID")
+        resolved_username = username or os.getenv("MAL_USERNAME", "").strip() or "@me"
+        redirect_uri = os.getenv("MAL_REDIRECT_URI") or None
+        per_second_raw = os.getenv("MAL_RATE_LIMIT_PER_SECOND")
+        per_second = float(per_second_raw) if per_second_raw else 1.0
+        return cls(
+            client_id=client_id,
+            username=resolved_username,
+            redirect_uri=redirect_uri,
+            per_second=per_second,
+            **kwargs,
         )
 
     def _headers(self) -> dict[str, str]:

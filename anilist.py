@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import random
 from dataclasses import dataclass, field
 from typing import Any
@@ -86,6 +87,46 @@ class AniListClient:
             self.username,
             self.per_second,
             bool(self.client_id and self.client_secret),
+        )
+
+    @classmethod
+    def from_env(cls, username: str | None = None, **kwargs) -> "AniListClient":
+        """Create an AniListClient from environment variables.
+
+        Reads ``ANILIST_CLIENT_ID``, ``ANILIST_CLIENT_SECRET``,
+        ``ANILIST_USERNAME`` (overridden by *username*), and optionally
+        ``ANILIST_REDIRECT_URI`` / ``ANILIST_RATE_LIMIT_PER_SECOND``.
+        Raises ``RuntimeError`` if required variables are missing.
+        """
+        client_id = os.getenv("ANILIST_CLIENT_ID", "").strip()
+        client_secret = os.getenv("ANILIST_CLIENT_SECRET", "").strip()
+        missing = [
+            n
+            for n, v in [
+                ("ANILIST_CLIENT_ID", client_id),
+                ("ANILIST_CLIENT_SECRET", client_secret),
+            ]
+            if not v
+        ]
+        if missing:
+            raise RuntimeError(
+                f"Missing required environment variable(s): {', '.join(missing)}"
+            )
+        resolved_username = username or os.getenv("ANILIST_USERNAME", "").strip() or ""
+        if not resolved_username:
+            raise RuntimeError(
+                "AniList username required — pass username= or set ANILIST_USERNAME"
+            )
+        redirect_uri = os.getenv("ANILIST_REDIRECT_URI") or None
+        per_second_raw = os.getenv("ANILIST_RATE_LIMIT_PER_SECOND")
+        per_second = float(per_second_raw) if per_second_raw else 1.0
+        return cls(
+            username=resolved_username,
+            client_id=client_id,
+            client_secret=client_secret,
+            redirect_uri=redirect_uri,
+            per_second=per_second,
+            **kwargs,
         )
 
     def _get_session(self) -> RateLimitedSession:

@@ -11,8 +11,10 @@ from pathlib import Path
 from typing import Any, Iterable
 
 import aiosqlite
+import spotipy
 from ratelimit import SPOTIFY_DEFAULT_BURST, SPOTIFY_DEFAULT_RPS, SyncRateLimiter
 from rich.progress import Progress
+from spotipy.oauth2 import SpotifyOAuth
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +67,24 @@ class RateLimitedSpotifyClient:
         self._limiter = SyncRateLimiter(
             per_second=per_second, name="Spotify", burst=burst
         )
+
+    @classmethod
+    def from_env(cls, **kwargs) -> "RateLimitedSpotifyClient":
+        """Create a RateLimitedSpotifyClient from environment variables.
+
+        Reads ``SPOTIFY_CLIENT_ID`` / ``SPOTIPY_CLIENT_ID``,
+        ``SPOTIFY_CLIENT_SECRET`` / ``SPOTIPY_CLIENT_SECRET``, and
+        ``SPOTIFY_REDIRECT_URI`` / ``SPOTIPY_REDIRECT_URI``.
+        Builds the spotipy OAuth2 auth manager and wraps it.
+        Raises ``RuntimeError`` if any required variable is missing.
+        """
+        auth = SpotifyOAuth(
+            client_id=_read_spotify_env("SPOTIPY_CLIENT_ID"),
+            client_secret=_read_spotify_env("SPOTIPY_CLIENT_SECRET"),
+            redirect_uri=_read_spotify_env("SPOTIPY_REDIRECT_URI"),
+            scope="playlist-modify-private playlist-modify-public",
+        )
+        return cls(spotipy.Spotify(auth_manager=auth), **kwargs)
 
     async def _call(self, fn, *args, **kwargs):
         # Acquire inside the thread so the event loop isn't blocked by sleep.
@@ -343,16 +363,7 @@ async def run_spotify_stage(
     progress: Progress,
 ) -> None:
 
-    import spotipy
-    from spotipy.oauth2 import SpotifyOAuth
-
-    auth = SpotifyOAuth(
-        client_id=_read_spotify_env("SPOTIPY_CLIENT_ID"),
-        client_secret=_read_spotify_env("SPOTIPY_CLIENT_SECRET"),
-        redirect_uri=_read_spotify_env("SPOTIPY_REDIRECT_URI"),
-        scope="playlist-modify-private playlist-modify-public",
-    )
-    client = RateLimitedSpotifyClient(spotipy.Spotify(auth_manager=auth))
+    client = RateLimitedSpotifyClient.from_env()
     user_id = (await client.current_user())["id"]
 
     if megaplaylist:

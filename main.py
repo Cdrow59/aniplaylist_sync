@@ -33,8 +33,9 @@ from db import (
 )
 from logging_config import console
 from mal import MALAnimeEntry, MALClient
-from scraper import scrape
+from scraper import AlgoliaClient, ScrapeResult
 from series import discover_series, save_series_clusters
+from spotify import run_spotify_stage
 
 logger = logging.getLogger(__name__)
 
@@ -155,6 +156,7 @@ async def _search_one(
     exact_filter: bool,
     headed: bool,
     *,
+    algolia: AlgoliaClient,
     mal_id: int,
     mal_title: str,
     save_html: bool,
@@ -166,7 +168,9 @@ async def _search_one(
     # ── Pass 1: static data only ──────────────────────────────────────────
     logger.info("%s Pass 1 — querying '%s'", ctx, title_query)
     try:
-        scrape_result = await scrape(title_query, headless=not headed, mal_label=ctx)
+        scrape_result = await algolia.scrape(
+            title_query, headless=not headed, mal_label=ctx
+        )
     except (PlaywrightError, RuntimeError, ValueError, OSError) as exc:
         logger.warning("%s Pass 1 failed for query '%s': %s", ctx, title_query, exc)
         attempt_logs.append(
@@ -238,7 +242,7 @@ async def _search_one(
     )
 
     try:
-        scrape_result2 = await scrape(
+        scrape_result2 = await algolia.scrape(
             title_query,
             headless=not headed,
             fetch_portal_indices=unmatched_indices,
@@ -343,6 +347,7 @@ async def run_aniplaylist_stage(
     db_path: Path,
     mal_entries: list[MALAnimeEntry],
     *,
+    algolia: AlgoliaClient,
     headed: bool,
     exact_filter: bool,
     aniplaylist_delay: float,
@@ -374,6 +379,7 @@ async def run_aniplaylist_stage(
                 exact_titles,
                 exact_filter,
                 headed,
+                algolia=algolia,
                 mal_id=entry.mal_id,
                 mal_title=entry.title,
                 allow_pass2=False,
@@ -409,6 +415,7 @@ async def run_aniplaylist_stage(
                     exact_titles,
                     exact_filter,
                     headed,
+                    algolia=algolia,
                     mal_id=entry.mal_id,
                     mal_title=entry.title,
                     allow_pass2=True,
@@ -542,8 +549,6 @@ async def run_spotify_stage_if_needed(
         logger.info("Dry run enabled — skipping Spotify stage")
         return
 
-    from spotify import run_spotify_stage
-
     if args.confirm:
         if not Confirm.ask("\nRun Spotify?", console=console):
             logger.info("Spotify stage skipped — user declined confirmation")
@@ -572,27 +577,15 @@ def create_client(args) -> tuple[
     str | None,
 ]:
     if args.anilist:
-        client = AniListClient(
-            username=args.username,
-            client_id=read_env("ANILIST_CLIENT_ID"),
-            client_secret=read_env("ANILIST_CLIENT_SECRET"),
-            redirect_uri=os.getenv("ANILIST_REDIRECT_URI"),
-        )
-
+        client = AniListClient.from_env(username=args.username)
         status = (
             ANILIST_STATUS_MAP.get(normalize_status(args.status))
             if args.status
             else None
         )
-
         return client, "AniList", status
 
-    client = MALClient(
-        client_id=read_env("MAL_CLIENT_ID"),
-        username=args.username or "@me",
-        redirect_uri=os.getenv("MAL_REDIRECT_URI"),
-    )
-
+    client = MALClient.from_env(username=args.username)
     status = normalize_status(args.status) if args.status else None
 
     return client, "MAL", status
@@ -600,6 +593,7 @@ def create_client(args) -> tuple[
 
 async def run_main_pipeline(args) -> list[dict[str, object]]:
     client, source_label, status = create_client(args)
+    algolia = AlgoliaClient.from_env()
 
     try:
         with create_progress() as progress:
@@ -654,6 +648,7 @@ async def run_main_pipeline(args) -> list[dict[str, object]]:
                 run_aniplaylist_stage(
                     args.db,
                     entries,
+                    algolia=algolia,
                     headed=args.headed,
                     exact_filter=not args.no_exact_filter,
                     aniplaylist_delay=delay,
@@ -685,6 +680,10 @@ async def run_main_pipeline(args) -> list[dict[str, object]]:
                 source_label,
                 exc,
             )
+        try:
+            await algolia.close()
+        except Exception as exc:
+            logger.warning("Error closing AlgoliaClient: %s", exc)
 
 
 async def _run_impl(args) -> None:
@@ -710,8 +709,6 @@ async def _run_impl(args) -> None:
             return
 
     with create_progress() as progress:
-        from spotify import run_spotify_stage
-
         await run_spotify_stage(
             args.db,
             megaplaylist=bool(args.megaplaylist),

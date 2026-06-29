@@ -129,11 +129,10 @@ def dedup(values: Iterable[str]) -> list[str]:
     return out
 
 
-def parse_song_type(raw: str) -> tuple[str, int | None]:
-    label = normalize_text(raw)
-    m = _TRAILING_DIGITS.search(label)
-    seq = int(m.group()) if m else None
-    kind = _TRAILING_DIGITS.sub("", label).strip()
+def parse_song_type(basic: "BasicData") -> tuple[str, int | None]:
+    """Return (song_type, sequence) using the pre-parsed scraper fields."""
+    kind = normalize_text(basic["song_type_raw"])
+    seq = basic.get("song_type_sequence")  # type: ignore[typeddict-item]
     return kind, seq
 
 
@@ -226,7 +225,7 @@ def _build_result(
         return None
 
     anime_title = basic["anime_title"]
-    song_type, sequence = parse_song_type(basic["song_type_raw"])
+    song_type, sequence = parse_song_type(basic)
     artists = dedup(basic["artist_values"])
     spotify_link = basic["spotify_link"] or None
     source_index = basic["source_index"]

@@ -43,15 +43,13 @@ logger = logging.getLogger(__name__)
 MAL_DEFAULT_RPS: float = 1.0  # MAL docs: ~3 req/s; 1.0 is conservative
 ANILIST_DEFAULT_RPS: float = 1.0  # AniList: ~90 req/min; 1.0 ≈ 60 req/min
 SPOTIFY_DEFAULT_RPS: float = 5.0  # spotipy handles 429s; 5.0 stays well under
-ANIPLAYLIST_DEFAULT_RPS: float = 0.5  # 2 s floor between scrapes
-ALGOLIA_DEFAULT_RPS: float = 5.0      # 5 req/s — well under Algolia's ceiling
+ALGOLIA_DEFAULT_RPS: float = 5.0  # 5 req/s — well under Algolia's ceiling
 
 # Default burst budgets — number of requests allowed with no delay at startup
 MAL_DEFAULT_BURST: int = 1
 ANILIST_DEFAULT_BURST: int = 1
 SPOTIFY_DEFAULT_BURST: int = 1
-ANIPLAYLIST_DEFAULT_BURST: int = 1
-ALGOLIA_DEFAULT_BURST: int = 3        # allow a small burst on first search
+ALGOLIA_DEFAULT_BURST: int = 1  # allow a small burst on first search
 
 
 # ---------------------------------------------------------------------------
@@ -199,61 +197,6 @@ class SyncRateLimiter:
 
 
 # ---------------------------------------------------------------------------
-# AniPlaylist scrape throttle
-# ---------------------------------------------------------------------------
-
-
-class AniPlaylistLimiter:
-    """Async rate limiter for AniPlaylist *scrape calls* (not HTTP requests).
-
-    AniPlaylist is scraped via Playwright, so there are no HTTP sessions to
-    throttle directly.  This limiter sits one level up and enforces a minimum
-    gap between full ``scrape()`` invocations so the site isn't hammered.
-
-    The Playwright overhead (browser launch + page load + scroll) already
-    takes several seconds per scrape; this limiter adds an *additional*
-    floor when that natural delay is shorter than ``min_gap_s``.
-
-    Args:
-        per_scrape: Maximum scrapes per second (default 0.5 → 2 s gap).
-                    Set to e.g. 1.0 for faster scraping when experimenting.
-        name:       Label for log lines.
-    """
-
-    def __init__(
-        self,
-        per_scrape: float = ANIPLAYLIST_DEFAULT_RPS,
-        *,
-        name: str = "AniPlaylist",
-        burst: int = ANIPLAYLIST_DEFAULT_BURST,
-    ) -> None:
-        if per_scrape <= 0:
-            raise ValueError(f"per_scrape must be > 0, got {per_scrape!r}")
-        self._inner = RateLimiter(per_second=per_scrape, name=name, burst=burst)
-        logger.info(
-            "AniPlaylistLimiter[%s] created — %.3f scrapes/s  interval=%.3fs  burst=%d",
-            name,
-            per_scrape,
-            1.0 / per_scrape,
-            burst,
-        )
-
-    async def acquire(self) -> None:
-        """Wait until the next scrape slot is available."""
-        logger.debug("AniPlaylistLimiter[%s] acquiring scrape slot", self.name)
-        await self._inner.acquire()
-        logger.debug("AniPlaylistLimiter[%s] scrape slot acquired", self.name)
-
-    @property
-    def per_scrape(self) -> float:
-        return self._inner.per_second
-
-    @property
-    def name(self) -> str:
-        return self._inner.name
-
-
-# ---------------------------------------------------------------------------
 # Algolia API rate limiter
 # ---------------------------------------------------------------------------
 
@@ -284,7 +227,7 @@ class AlgoliaLimiter:
         if per_second <= 0:
             raise ValueError(f"per_second must be > 0, got {per_second!r}")
         self._inner = RateLimiter(per_second=per_second, name=name, burst=burst)
-        logger.info(
+        logger.debug(
             "AlgoliaLimiter[%s] created — %.1f req/s  interval=%.3fs  burst=%d",
             name,
             per_second,
