@@ -1,7 +1,6 @@
 aiosqlite
 aiohttp
 networkx
-playwright
 python-dotenv
 rich
 spotipy

@@ -44,12 +44,14 @@ MAL_DEFAULT_RPS: float = 1.0  # MAL docs: ~3 req/s; 1.0 is conservative
 ANILIST_DEFAULT_RPS: float = 1.0  # AniList: ~90 req/min; 1.0 ≈ 60 req/min
 SPOTIFY_DEFAULT_RPS: float = 5.0  # spotipy handles 429s; 5.0 stays well under
 ANIPLAYLIST_DEFAULT_RPS: float = 0.5  # 2 s floor between scrapes
+ALGOLIA_DEFAULT_RPS: float = 5.0      # 5 req/s — well under Algolia's ceiling
 
 # Default burst budgets — number of requests allowed with no delay at startup
 MAL_DEFAULT_BURST: int = 1
 ANILIST_DEFAULT_BURST: int = 1
 SPOTIFY_DEFAULT_BURST: int = 1
 ANIPLAYLIST_DEFAULT_BURST: int = 1
+ALGOLIA_DEFAULT_BURST: int = 3        # allow a small burst on first search
 
 
 # ---------------------------------------------------------------------------
@@ -244,6 +246,58 @@ class AniPlaylistLimiter:
 
     @property
     def per_scrape(self) -> float:
+        return self._inner.per_second
+
+    @property
+    def name(self) -> str:
+        return self._inner.name
+
+
+# ---------------------------------------------------------------------------
+# Algolia API rate limiter
+# ---------------------------------------------------------------------------
+
+
+class AlgoliaLimiter:
+    """Async rate limiter for Algolia search API requests.
+
+    Algolia's public search-only keys are very permissive, but we throttle
+    to ``ALGOLIA_DEFAULT_RPS`` (5 req/s) to be a polite client and avoid
+    any anti-scraping measures on aniplaylist.com's side.
+
+    A small burst budget (default 3) lets the first page-0 + concurrent
+    page fetches proceed without artificial delays on startup.
+
+    Args:
+        per_second: Maximum requests per second (default 5.0).
+        name:       Label for log lines.
+        burst:      Initial burst budget (default 3).
+    """
+
+    def __init__(
+        self,
+        per_second: float = ALGOLIA_DEFAULT_RPS,
+        *,
+        name: str = "Algolia",
+        burst: int = ALGOLIA_DEFAULT_BURST,
+    ) -> None:
+        if per_second <= 0:
+            raise ValueError(f"per_second must be > 0, got {per_second!r}")
+        self._inner = RateLimiter(per_second=per_second, name=name, burst=burst)
+        logger.info(
+            "AlgoliaLimiter[%s] created — %.1f req/s  interval=%.3fs  burst=%d",
+            name,
+            per_second,
+            1.0 / per_second,
+            burst,
+        )
+
+    async def acquire(self) -> None:
+        """Wait until a request slot is available."""
+        await self._inner.acquire()
+
+    @property
+    def per_second(self) -> float:
         return self._inner.per_second
 
     @property
