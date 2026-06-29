@@ -577,7 +577,6 @@ def create_client(args) -> tuple[
             client_id=read_env("ANILIST_CLIENT_ID"),
             client_secret=read_env("ANILIST_CLIENT_SECRET"),
             redirect_uri=os.getenv("ANILIST_REDIRECT_URI"),
-            per_second=float(read_env("ANILIST_RATE_LIMIT_PER_SECOND", "5")),
         )
 
         status = (
@@ -592,7 +591,6 @@ def create_client(args) -> tuple[
         client_id=read_env("MAL_CLIENT_ID"),
         username=args.username or "@me",
         redirect_uri=os.getenv("MAL_REDIRECT_URI"),
-        per_second=float(read_env("MAL_RATE_LIMIT_PER_SECOND", "5")),
     )
 
     status = normalize_status(args.status) if args.status else None
