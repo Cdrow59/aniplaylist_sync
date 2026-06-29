@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import aiohttp
+from ratelimit import ANILIST_DEFAULT_BURST, ANILIST_DEFAULT_RPS, RateLimiter
 
 logger = logging.getLogger(__name__)
 
@@ -20,24 +21,21 @@ RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 
 
 class RateLimitedSession:
-    def __init__(self, per_second: float = 1.0):
-        self.per_second = per_second
+    """aiohttp session wrapped with a :class:`~ratelimit.RateLimiter`."""
+
+    def __init__(
+        self,
+        per_second: float = ANILIST_DEFAULT_RPS,
+        burst: int = ANILIST_DEFAULT_BURST,
+    ) -> None:
         self._session = aiohttp.ClientSession()
-        self._lock = asyncio.Lock()
-        self._last_request = 0.0
+        self._limiter = RateLimiter(per_second=per_second, name="AniList", burst=burst)
 
-    async def post(self, *args, **kwargs):
-        async with self._lock:
-            now = asyncio.get_running_loop().time()
-            if self._last_request:
-                delay = (1.0 / self.per_second) - (now - self._last_request)
-                if delay > 0:
-                    logger.debug("Rate limit: sleeping %.3fs", delay)
-                    await asyncio.sleep(delay)
-            self._last_request = asyncio.get_running_loop().time()
-        return await self._session.post(*args, **kwargs)
+    async def post(self, *args: object, **kwargs: object) -> object:
+        await self._limiter.acquire()
+        return await self._session.post(*args, **kwargs)  # type: ignore[arg-type]
 
-    async def close(self):
+    async def close(self) -> None:
         logger.debug("Closing AniList HTTP session")
         await self._session.close()
 
@@ -99,9 +97,7 @@ class AniListClient:
         if self._token:
             return self._token
         if not self.client_id or not self.client_secret:
-            raise RuntimeError(
-                "AniList client_id and client_secret are required"
-            )
+            raise RuntimeError("AniList client_id and client_secret are required")
         logger.debug("Requesting AniList OAuth2 client credentials token")
         payload = {
             "grant_type": "client_credentials",
@@ -186,15 +182,11 @@ class AniListClient:
                     msg = "; ".join(e.get("message", str(e)) for e in errors)
                     logger.warning("AniList GraphQL errors: %s", msg)
 
-                    status_codes = {
-                        e.get("status") for e in errors if e.get("status")
-                    }
+                    status_codes = {e.get("status") for e in errors if e.get("status")}
                     if status_codes & {429, 500, 502, 503, 504}:
                         base_delay = max(1.5, 6.0 / self.per_second)
                         delay = base_delay * (3**attempt)
-                        delay += random.uniform(
-                            base_delay * 0.5, base_delay * 1.5
-                        )
+                        delay += random.uniform(base_delay * 0.5, base_delay * 1.5)
                         logger.warning(
                             "AniList retryable GraphQL error (attempt %d/6), sleeping %.2fs",
                             attempt + 1,

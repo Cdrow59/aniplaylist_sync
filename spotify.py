@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 import aiosqlite
+from ratelimit import SPOTIFY_DEFAULT_BURST, SPOTIFY_DEFAULT_RPS, SyncRateLimiter
 from rich.progress import Progress
 
 logger = logging.getLogger(__name__)
@@ -47,23 +48,31 @@ def _read_spotify_env(name: str) -> str:
 
 
 class RateLimitedSpotifyClient:
-    """Wraps a spotipy.Spotify instance with per-second rate limiting."""
+    """Wraps a spotipy.Spotify instance with per-second rate limiting.
 
-    def __init__(self, client: Any, per_second: float = 5.0):
+    Uses :class:`~ratelimit.SyncRateLimiter` internally so all rate-limit
+    logic lives in one place.  The actual spotipy calls run in a thread pool
+    via ``asyncio.to_thread`` so the event loop is never blocked.
+    """
+
+    def __init__(
+        self,
+        client: Any,
+        per_second: float = SPOTIFY_DEFAULT_RPS,
+        burst: int = SPOTIFY_DEFAULT_BURST,
+    ) -> None:
         self._client = client
-        self._per_second = per_second
-        self._lock = asyncio.Lock()
-        self._last_request: float = 0.0
+        self._limiter = SyncRateLimiter(
+            per_second=per_second, name="Spotify", burst=burst
+        )
 
     async def _call(self, fn, *args, **kwargs):
-        async with self._lock:
-            now = asyncio.get_running_loop().time()
-            delay = (1.0 / self._per_second) - (now - self._last_request)
-            if delay > 0:
-                logger.debug("Spotify rate limit: sleeping %.3fs", delay)
-                await asyncio.sleep(delay)
-            self._last_request = asyncio.get_running_loop().time()
-        return await asyncio.to_thread(fn, *args, **kwargs)
+        # Acquire inside the thread so the event loop isn't blocked by sleep.
+        def _run():
+            self._limiter.acquire()
+            return fn(*args, **kwargs)
+
+        return await asyncio.to_thread(_run)
 
     async def current_user(self):
         return await self._call(self._client.current_user)
@@ -343,10 +352,7 @@ async def run_spotify_stage(
         redirect_uri=_read_spotify_env("SPOTIPY_REDIRECT_URI"),
         scope="playlist-modify-private playlist-modify-public",
     )
-    per_second = float(os.getenv("SPOTIFY_RATE_LIMIT_PER_SECOND", "5"))
-    client = RateLimitedSpotifyClient(
-        spotipy.Spotify(auth_manager=auth), per_second=per_second
-    )
+    client = RateLimitedSpotifyClient(spotipy.Spotify(auth_manager=auth))
     user_id = (await client.current_user())["id"]
 
     if megaplaylist:
