@@ -177,8 +177,9 @@ def _hit_to_basic(hit: dict, index: int) -> BasicData:
     anime_titles: list[str] = hit.get("anime_titles") or []
     anime_title = anime_titles[0] if anime_titles else ""
 
-    # song_key gives "OP1"/"ED4" which parser splits into type + sequence
-    song_type_raw = hit.get("song_key") or hit.get("song_type_short") or hit.get("song_type") or ""
+    # Take only the first word of song_key — e.g. "ED EP 4, 6 &" → "ED"
+    song_key = (hit.get("song_key") or hit.get("song_type_short") or hit.get("song_type") or "")
+    song_type_raw = song_key.split()[0] if song_key.split() else ""
 
     titles: list[str] = hit.get("titles") or []
     title_raw = titles[0] if titles else ""
