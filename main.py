@@ -22,6 +22,7 @@ from rich.progress import (
 from rich.prompt import Confirm, Prompt
 
 from anilist import AniListClient
+from aniplaylist import AlgoliaClient
 from db import (
     DB_PATH,
     FAILURE_NO_MATCH,
@@ -33,7 +34,6 @@ from db import (
 )
 from logging_config import console
 from mal import MALAnimeEntry, MALClient
-from scraper import AlgoliaClient, ScrapeResult
 from series import discover_series, save_series_clusters
 from spotify import run_spotify_stage
 

@@ -73,7 +73,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 _RETRY_ATTEMPTS = 4  # total attempts (1 initial + 3 retries)
-_RETRY_BASE_DELAY = 2.0  # seconds — doubled on each retry
+_RETRY_BASE_DELAY = 1.0  # seconds — doubled on each retry
 _RETRY_MAX_DELAY = 60.0  # cap so we never wait longer than this
 
 # ---------------------------------------------------------------------------
