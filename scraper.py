@@ -308,11 +308,14 @@ async def scrape(
     results: list[ResultItem] = []
     for idx, hit in enumerate(all_hits):
         basic = _hit_to_basic(hit, idx)
-        # Pass alternate titles as synonyms so parser's existing synonym
-        # matching handles them — anime_titles[0] is already in anime_title,
-        # so we only need [1:] here.
-        alternates = (hit.get("anime_titles") or [])[1:]
-        item = ResultItem(basic_data=basic, portal_data={"synonyms": alternates})
+        item = ResultItem(basic_data=basic)
+        # Only inject alternate titles as synonyms when fetch_portal_indices
+        # is set — that signals Pass 2, meaning all standard MAL title queries
+        # have already been exhausted.  In Pass 1 (fetch_portal_indices=None)
+        # we leave portal_data absent so the parser does strict matching only.
+        if fetch_portal_indices is not None:
+            alternates = (hit.get("anime_titles") or [])[1:]
+            item["portal_data"] = {"synonyms": alternates}
         results.append(item)
 
     return ScrapeResult(
