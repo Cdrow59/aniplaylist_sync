@@ -118,7 +118,7 @@ class MALClient:
                     # jitter (prevents sync retry waves)
                     delay += random.uniform(base_delay * 0.5, base_delay * 1.5)
 
-                    logger.warning(
+                    logger.debug(
                         "MAL retryable HTTP %d for %s (attempt %d/6), sleeping %.2fs",
                         resp.status,
                         url,

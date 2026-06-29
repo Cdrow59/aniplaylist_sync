@@ -105,7 +105,6 @@ SCROLL_MAX_ITER = 60
 SCROLL_STABLE_REPS = 3
 
 STATS_TIMEOUT_MS = 20_000
-SEARCH_SETTLE_S = 0.5
 PORTAL_TIMEOUT_MS = 8_000
 PORTAL_STABLE_S = 0.4
 PORTAL_CLOSE_S = 0.4
@@ -190,7 +189,7 @@ async def _type_query_and_wait(page: Page, query: str) -> None:
             """,
             {"selector": SEARCH_INPUT_SEL, "value": query},
         )
-        await asyncio.sleep(SEARCH_SETTLE_S)
+        await asyncio.sleep(0.25)
 
     try:
         await page.wait_for_function(
@@ -212,103 +211,57 @@ async def _type_query_and_wait(page: Page, query: str) -> None:
         )
     except PWTimeout:
         logger.debug("Stats timeout for '%s' — continuing with partial results", query)
-        return
-
-    # Stats updated but React hasn't re-rendered the result cards yet —
-    # give the DOM a moment to flush homepage cards and render new results.
-    await asyncio.sleep(SEARCH_SETTLE_S)
 
 
-async def _scroll_until_stable(page: Page) -> list[BasicData]:
+async def _scroll_until_stable(page: Page) -> None:
     full_sel = f"{RESULTS_CONTAINER_SEL} {RESULT_CARD_SEL}"
-
-    seen: dict[str, BasicData] = {}
-
+    prev_count = 0
     stable = 0
-    previous_count = 0
 
     for i in range(SCROLL_MAX_ITER):
-        cards = page.locator(full_sel)
+        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        await asyncio.sleep(SCROLL_PAUSE_S)
 
-        raw_cards = await cards.evaluate_all(f"""
+        count = await page.locator(full_sel).count()
+        logger.debug("Scroll %d — cards: %d", i, count)
+
+        if count == prev_count:
+            stable += 1
+            if stable >= SCROLL_STABLE_REPS:
+                logger.info("Scroll stable at %d cards after %d steps", count, i + 1)
+                break
+        else:
+            stable = 0
+            prev_count = count
+
+
+async def _extract_basic_data_all(page: Page) -> list[BasicData]:
+    full_sel = f"{RESULTS_CONTAINER_SEL} {RESULT_CARD_SEL}"
+    raw: list[dict] = await page.locator(full_sel).evaluate_all(f"""
         (cards) => cards.map((card, index) => {{
             const text = (sel) => {{
                 const el = card.querySelector(sel);
                 return el ? el.textContent.trim() : "";
             }};
-
-            const spotifyEl =
-                card.querySelector({SPOTIFY_LINK_SEL!r});
-
+            const unreleased = Array.from(card.querySelectorAll("p")).some(
+                el => el.textContent.trim() === {UNRELEASED_TEXT!r}
+            );
+            const spotifyEl = card.querySelector({SPOTIFY_LINK_SEL!r});
             return {{
-                anime_title: text({ANIME_TITLE_SEL!r}),
+                anime_title:   text({ANIME_TITLE_SEL!r}),
                 song_type_raw: text({SONG_TYPE_SEL!r}),
-                title_raw: text({SONG_TITLE_SEL!r}),
-
-                artist_values:
-                    Array.from(
-                        card.querySelectorAll({ARTIST_SEL!r})
-                    ).map(el => el.textContent.trim()),
-
-                spotify_link:
-                    spotifyEl
-                    ? new URL(
-                        spotifyEl.getAttribute("href"),
-                        document.baseURI
-                      ).href
-                    : null,
-
-                unreleased:
-                    Array.from(card.querySelectorAll("p"))
-                    .some(
-                        el =>
-                        el.textContent.trim() ===
-                        {UNRELEASED_TEXT!r}
-                    )
+                title_raw:     text({SONG_TITLE_SEL!r}),
+                artist_values: Array.from(card.querySelectorAll({ARTIST_SEL!r}))
+                                    .map(el => el.textContent.trim()),
+                spotify_link:  spotifyEl
+                               ? new URL(spotifyEl.getAttribute("href"), document.baseURI).href
+                               : null,
+                source_index:  index,
+                unreleased,
             }};
         }})
         """)
-
-        for index, raw in enumerate(raw_cards):
-            item = BasicData(
-                **raw,
-                source_index=len(seen),
-            )
-
-            # stable unique key
-            key = (
-                item["anime_title"],
-                item["title_raw"],
-                item["spotify_link"],
-            )
-
-            seen[key] = item
-
-        logger.debug(
-            "Scroll %d — DOM=%d collected=%d",
-            i,
-            len(raw_cards),
-            len(seen),
-        )
-
-        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-
-        await asyncio.sleep(SCROLL_PAUSE_S)
-
-        if len(seen) == previous_count:
-            stable += 1
-            if stable >= SCROLL_STABLE_REPS:
-                logger.info(
-                    "Scroll stable at %d cards after %d steps",
-                    len(seen),
-                    i + 1,
-                )
-                break
-        else:
-            previous_count = len(seen)
-            stable = 0
-
-    return list(seen.values())
+    return [BasicData(**r) for r in raw]
 
 
 # ---------------------------------------------------------------------------
@@ -551,10 +504,10 @@ async def scrape(
                 raise last_err
 
             await _type_query_and_wait(page, query)
-
+            await _scroll_until_stable(page)
             raw_html_snapshot = await page.content()
 
-            basic_data_list = await _scroll_until_stable(page)
+            basic_data_list = await _extract_basic_data_all(page)
             logger.info(
                 "%s Phase 1 complete — %d cards", mal_label, len(basic_data_list)
             )
