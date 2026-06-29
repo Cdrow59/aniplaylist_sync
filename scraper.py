@@ -305,10 +305,15 @@ async def scrape(
 
     logger.info("%s Algolia: fetched %d total hits", mal_label, len(all_hits))
 
-    results: list[ResultItem] = [
-        ResultItem(basic_data=_hit_to_basic(hit, idx))
-        for idx, hit in enumerate(all_hits)
-    ]
+    results: list[ResultItem] = []
+    for idx, hit in enumerate(all_hits):
+        basic = _hit_to_basic(hit, idx)
+        # Pass alternate titles as synonyms so parser's existing synonym
+        # matching handles them — anime_titles[0] is already in anime_title,
+        # so we only need [1:] here.
+        alternates = (hit.get("anime_titles") or [])[1:]
+        item = ResultItem(basic_data=basic, portal_data={"synonyms": alternates})
+        results.append(item)
 
     return ScrapeResult(
         query=query,
