@@ -155,32 +155,55 @@ def _build_payload(query: str, page: int) -> dict:
 def _extract_spotify(links: list[dict]) -> str | None:
     """Return the Spotify URL from a hit's links list, or None."""
     for link in links:
-        label = (link.get("label") or "").lower()
-        if "spotify" in label:
-            return link.get("url") or link.get("link") or None
+        if (link.get("platform") or "").lower() == "spotify" and link.get("link"):
+            return link["link"]
     return None
 
 
 def _hit_to_basic(hit: dict, index: int) -> BasicData:
-    """Map a raw Algolia hit dict to a BasicData TypedDict."""
-    links: list[dict] = hit.get("links") or []
+    """Map a raw Algolia hit dict to a BasicData TypedDict.
 
-    # artists may be a list of strings or a list of dicts with a "name" key
-    raw_artists = hit.get("artists") or []
-    if raw_artists and isinstance(raw_artists[0], dict):
-        artist_values = [a.get("name", "") for a in raw_artists if a.get("name")]
-    else:
-        artist_values = [str(a) for a in raw_artists if a]
+    Real schema (from HAR inspection):
+        hit["anime_titles"]      list[str]  — [0] is the primary English title
+        hit["song_key"]          str        — e.g. "OP1", "ED4"
+        hit["song_type"]         str        — e.g. "Opening", "Ending"
+        hit["song_type_short"]   str        — e.g. "OP", "ED"
+        hit["titles"]            list[str]  — song titles; [0] is primary
+        hit["display_artists"]   list[str]  — ready-to-use artist name list
+        hit["artists"]           list[dict] — each has "names": list[str]
+        hit["links"]             list[dict] — each has "platform" and "link"
+        hit["unreleased"]        int        — 0 = released, 1 = unreleased
+    """
+    anime_titles: list[str] = hit.get("anime_titles") or []
+    anime_title = anime_titles[0] if anime_titles else ""
 
-    status: str = (hit.get("status") or "").lower()
-    unreleased = status in {"unreleased", "not_released", "upcoming"}
+    # song_key gives "OP1"/"ED4" which parser splits into type + sequence
+    song_type_raw = hit.get("song_key") or hit.get("song_type_short") or hit.get("song_type") or ""
+
+    titles: list[str] = hit.get("titles") or []
+    title_raw = titles[0] if titles else ""
+
+    artist_values: list[str] = hit.get("display_artists") or []
+    if not artist_values:
+        for a in (hit.get("artists") or []):
+            names = a.get("names") or []
+            if names:
+                artist_values.append(names[0])
+
+    spotify_link: str | None = None
+    for link in (hit.get("links") or []):
+        if (link.get("platform") or "").lower() == "spotify" and link.get("link"):
+            spotify_link = link["link"]
+            break
+
+    unreleased = bool(hit.get("unreleased", 0))
 
     return BasicData(
-        anime_title   = hit.get("anime") or hit.get("anime_title") or "",
-        song_type_raw = hit.get("song_type") or "",
-        title_raw     = hit.get("title") or hit.get("name") or "",
+        anime_title   = anime_title,
+        song_type_raw = song_type_raw,
+        title_raw     = title_raw,
         artist_values = artist_values,
-        spotify_link  = _extract_spotify(links),
+        spotify_link  = spotify_link,
         source_index  = index,
         unreleased    = unreleased,
     )
