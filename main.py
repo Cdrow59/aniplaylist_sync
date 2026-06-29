@@ -82,10 +82,10 @@ def _add_title_candidate(target: list[str], value: object | None) -> None:
 
 def candidate_titles(entry: MALAnimeEntry) -> list[str]:
     candidates: list[str] = []
+    _add_title_candidate(candidates, entry.title)
     alt = entry.alternative_titles or {}
     if isinstance(alt, dict):
         _add_title_candidate(candidates, alt.get("en"))
-    _add_title_candidate(candidates, entry.title)
     if isinstance(alt, dict):
         _add_title_candidate(candidates, alt.get("ja"))
         _add_title_candidate(candidates, alt.get("synonyms"))
@@ -94,10 +94,10 @@ def candidate_titles(entry: MALAnimeEntry) -> list[str]:
 
 def exact_title_candidates(entry: MALAnimeEntry) -> list[str]:
     titles: list[str] = []
+    _add_title_candidate(titles, entry.title)
     alt = entry.alternative_titles or {}
     if isinstance(alt, dict):
         _add_title_candidate(titles, alt.get("en"))
-    _add_title_candidate(titles, entry.title)
     if isinstance(alt, dict):
         _add_title_candidate(titles, alt.get("ja"))
         _add_title_candidate(titles, alt.get("synonyms"))
