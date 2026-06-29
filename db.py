@@ -17,16 +17,8 @@ DB_PATH = Path("aniplaylist.sqlite3")
 # Failure type constants
 # ---------------------------------------------------------------------------
 
-# AniPlaylist returned zero cards for every candidate title tried.
-# The title simply isn't indexed on AniPlaylist.
 FAILURE_NOT_FOUND = "not_found"
-
-# AniPlaylist returned cards for at least one candidate, but none matched
-# any of our exact candidate titles (including portal synonym checks).
 FAILURE_NO_MATCH = "no_match"
-
-# Every scrape attempt for every candidate raised an exception or timed out
-# before returning any cards.  Likely a network or Playwright issue.
 FAILURE_SCRAPE_ERROR = "scrape_error"
 
 
@@ -40,7 +32,6 @@ async def init_db(db_path: Path) -> None:
     async with aiosqlite.connect(db_path) as db:
         await db.execute("PRAGMA foreign_keys = ON")
 
-        # One row per AniPlaylist search that returned results.
         await db.execute("""
             CREATE TABLE IF NOT EXISTS searches (
                 id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -53,7 +44,6 @@ async def init_db(db_path: Path) -> None:
             )
         """)
 
-        # Individual song results from a search.
         await db.execute("""
             CREATE TABLE IF NOT EXISTS results (
                 id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -74,15 +64,6 @@ async def init_db(db_path: Path) -> None:
             )
         """)
 
-        # One row per MAL entry that produced no usable results.
-        #
-        # failure_type  — queryable enum: not_found | no_match | scrape_error
-        # tried_queries — JSON array of every title string actually submitted
-        #                 to AniPlaylist, in order
-        # cards_seen    — total cards returned across all attempts (0 for
-        #                 not_found and scrape_error; >0 for no_match)
-        # attempt_log   — JSON array of per-attempt diagnostic dicts;
-        #                 NULL when failure_type is not_found (nothing to debug)
         await db.execute("""
             CREATE TABLE IF NOT EXISTS failed (
                 id              INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -201,22 +182,6 @@ async def save_failure(
     mal_status: str | None = None,
     attempt_log: list[dict] | None = None,
 ) -> None:
-    """
-    Persist a failed AniPlaylist lookup.
-
-    Parameters
-    ----------
-    failure_type : str
-        One of FAILURE_NOT_FOUND, FAILURE_NO_MATCH, FAILURE_SCRAPE_ERROR.
-    tried_queries : list[str]
-        Every candidate title string actually submitted to AniPlaylist, in order.
-    cards_seen : int
-        Total result cards observed across all attempts.  Should be 0 for
-        not_found and scrape_error, and >0 for no_match.
-    attempt_log : list[dict] | None
-        Per-attempt structured diagnostics from _search_one().  Pass None for
-        not_found failures — there's nothing useful to debug there.
-    """
     async with aiosqlite.connect(db_path) as db:
         await db.execute(
             """
@@ -245,3 +210,53 @@ async def save_failure(
             cards_seen,
             tried_queries,
         )
+
+
+# ---------------------------------------------------------------------------
+# Cached-mode loader
+# ---------------------------------------------------------------------------
+
+
+async def load_mal_entries_from_db(db_path: Path):
+    """
+    Reconstruct a deduplicated list of MALAnimeEntry-compatible dicts from
+    the titles stored in ``results`` and ``failed``.
+
+    Returns a list of dicts with keys:
+        mal_id, native_title, english_title, japanese_title, mal_status
+
+    One row per unique mal_id, ordered by mal_id.  Used by --cached to
+    populate the in-memory entry list without hitting the MAL API.
+    """
+    async with aiosqlite.connect(db_path) as db:
+        async with db.execute("""
+            SELECT mal_id, native_title, english_title, japanese_title, NULL AS mal_status
+            FROM results
+            WHERE mal_id IS NOT NULL
+            UNION
+            SELECT mal_id, native_title, english_title, japanese_title, mal_status
+            FROM failed
+            WHERE mal_id IS NOT NULL
+            ORDER BY mal_id
+        """) as cursor:
+            rows = await cursor.fetchall()
+
+    seen: set[int] = set()
+    entries = []
+    for mal_id, native_title, english_title, japanese_title, mal_status in rows:
+        mid = int(mal_id)
+        if mid in seen:
+            continue
+        seen.add(mid)
+        entries.append(
+            {
+                "mal_id": mid,
+                "native_title": native_title,
+                "english_title": english_title,
+                "japanese_title": japanese_title,
+                "mal_status": mal_status,
+            }
+        )
+
+    logger.info("load_mal_entries_from_db: %d unique MAL ID(s) loaded", len(entries))
+    return entries

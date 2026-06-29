@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import aiohttp
+from ratelimit import MAL_DEFAULT_BURST, MAL_DEFAULT_RPS, RateLimiter
 from rich.progress import Progress
 
 logger = logging.getLogger(__name__)
@@ -18,24 +19,19 @@ RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 
 
 class RateLimitedSession:
-    def __init__(self, per_second: float = 1.0):
-        self.per_second = per_second
+    """aiohttp session wrapped with a :class:`~ratelimit.RateLimiter`."""
+
+    def __init__(
+        self, per_second: float = MAL_DEFAULT_RPS, burst: int = MAL_DEFAULT_BURST
+    ) -> None:
         self._session = aiohttp.ClientSession()
-        self._lock = asyncio.Lock()
-        self._last_request = 0.0
+        self._limiter = RateLimiter(per_second=per_second, name="MAL", burst=burst)
 
-    async def get(self, *args, **kwargs):
-        async with self._lock:
-            now = asyncio.get_running_loop().time()
-            if self._last_request:
-                delay = (1.0 / self.per_second) - (now - self._last_request)
-                if delay > 0:
-                    logger.debug("Rate limit: sleeping %.3fs", delay)
-                    await asyncio.sleep(delay)
-            self._last_request = asyncio.get_running_loop().time()
-        return await self._session.get(*args, **kwargs)
+    async def get(self, *args: object, **kwargs: object) -> object:
+        await self._limiter.acquire()
+        return await self._session.get(*args, **kwargs)  # type: ignore[arg-type]
 
-    async def close(self):
+    async def close(self) -> None:
         logger.debug("Closing MAL HTTP session")
         await self._session.close()
 
@@ -57,6 +53,7 @@ class MALClient:
     client_id: str
     username: str
     access_token: str | None = None
+    redirect_uri: str | None = None
     base_url: str = "https://api.myanimelist.net/v2"
     per_second: float = 1.0
     session: RateLimitedSession = field(init=False, repr=False)
@@ -117,7 +114,7 @@ class MALClient:
                     # jitter (prevents sync retry waves)
                     delay += random.uniform(base_delay * 0.5, base_delay * 1.5)
 
-                    logger.warning(
+                    logger.debug(
                         "MAL retryable HTTP %d for %s (attempt %d/6), sleeping %.2fs",
                         resp.status,
                         url,

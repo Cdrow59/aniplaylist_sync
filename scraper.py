@@ -53,8 +53,19 @@ from playwright.async_api import TimeoutError as PWTimeout
 from playwright.async_api import (
     async_playwright,
 )
+from ratelimit import AniPlaylistLimiter
 
 logger = logging.getLogger(__name__)
+
+_scrape_limiter: AniPlaylistLimiter | None = None
+
+
+def _get_scrape_limiter() -> AniPlaylistLimiter:
+    global _scrape_limiter
+    if _scrape_limiter is None:
+        _scrape_limiter = AniPlaylistLimiter()
+    return _scrape_limiter
+
 
 # ---------------------------------------------------------------------------
 # Selectors
@@ -474,7 +485,13 @@ async def scrape(
     -------
     ScrapeResult
     """
+    logger.info(
+        "%s scrape() called — query=%r  headless=%s", mal_label, query, headless
+    )
+    await _get_scrape_limiter().acquire()
+    logger.debug("%s rate-limit slot acquired", mal_label)
     async with async_playwright() as pw:
+        logger.debug("%s launching Chromium  headless=%s", mal_label, headless)
         browser: Browser = await pw.chromium.launch(headless=headless)
         context: BrowserContext = await browser.new_context(
             user_agent=(
@@ -490,20 +507,27 @@ async def scrape(
 
         try:
             # ── Phase 1 ──────────────────────────────────────────────────
+            logger.info("%s Phase 1 — navigating to AniPlaylist", mal_label)
             last_err: Exception | None = None
             for base_url in BASE_URLS:
                 try:
                     await page.goto(
                         base_url, wait_until="domcontentloaded", timeout=15_000
                     )
+                    logger.debug("%s page loaded: %s", mal_label, base_url)
                     last_err = None
                     break
                 except Exception as exc:
+                    logger.warning(
+                        "%s failed to load %s — %s", mal_label, base_url, exc
+                    )
                     last_err = exc
             if last_err:
                 raise last_err
 
+            logger.info("%s typing query and waiting for results", mal_label)
             await _type_query_and_wait(page, query)
+            logger.info("%s scrolling until stable", mal_label)
             await _scroll_until_stable(page)
             raw_html_snapshot = await page.content()
 
@@ -550,6 +574,7 @@ async def scrape(
         finally:
             await page.close()
             await browser.close()
+            logger.debug("%s browser closed", mal_label)
 
     return ScrapeResult(
         query=query,

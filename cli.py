@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+from datetime import datetime
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -15,17 +16,21 @@ from dotenv import load_dotenv
 from db import DB_PATH
 from logging_config import setup_logging
 
-load_dotenv(dotenv_path=Path(__file__).with_name(".env"), override=False)
+load_dotenv(dotenv_path=Path(__file__).with_name(".env"), override=True)
 
 
 def _make_argparser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Fetch a MAL user's anime titles and search each one on AniPlaylist."
     )
-    parser.add_argument("--db", type=Path, default=DB_PATH, help="SQLite database path")
-    parser.add_argument("--username", default="Cdrow", help="MAL username to fetch")
-    parser.add_argument("--client-id", default=None, help="MAL client ID")
-    parser.add_argument("--access-token", default=None, help="MAL access token")
+    parser.add_argument("--db", type=Path, default=None, help="SQLite database path")
+    parser.add_argument(
+        "--username",
+        type=str,
+        default=None,
+        required=True,
+        help="Username to run the query for.",
+    )
     parser.add_argument(
         "--dry-run",
         action="store_true",
@@ -83,6 +88,19 @@ def _make_argparser() -> argparse.ArgumentParser:
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
         help="Logging level",
     )
+    parser.add_argument(
+        "--anilist",
+        action="store_true",
+        help="Use AniList instead of MAL as the anime list source",
+    )
+    parser.add_argument(
+        "--cached",
+        action="store_true",
+        help=(
+            "Skip MAL fetching and AniPlaylist scraping entirely; "
+            "run the Spotify stage against existing DB data only."
+        ),
+    )
     return parser
 
 
@@ -90,9 +108,21 @@ def main() -> None:
     parser = _make_argparser()
     args = parser.parse_args()
 
+    if args.db is None:
+        args.db = Path(f"aniplaylist_{args.username}.sqlite3")
+        # Use user_db if it exists, otherwise fall back to DB_PATH
+
     # Initialize logging with specified level
+    safe_timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+
+    log_dir = Path("debug/logs")
+    log_dir.mkdir(parents=True, exist_ok=True)
+
     log_level = getattr(logging, args.log_level, logging.INFO)
-    setup_logging(level=log_level, log_file=Path("aniplaylist_sync.log"))
+    setup_logging(
+        level=log_level,
+        log_file=Path(f"debug/logs/aniplaylist_sync_{safe_timestamp}.log"),
+    )
 
     logger = logging.getLogger(__name__)
     logger.debug("Parsed CLI args: %s", vars(args))
