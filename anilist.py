@@ -185,7 +185,7 @@ class AniListClient:
 
                 if resp.status in {429, 500, 502, 503, 504}:
                     text = await resp.text()
-                    base_delay = max(1.5, 6.0 / self.per_second)
+                    base_delay = max(1.5, 6.0 / self._get_session()._limiter.per_second)
                     delay = base_delay * (3**attempt)
                     delay += random.uniform(base_delay * 0.5, base_delay * 1.5)
                     logger.warning(
@@ -216,7 +216,7 @@ class AniListClient:
 
                     status_codes = {e.get("status") for e in errors if e.get("status")}
                     if status_codes & {429, 500, 502, 503, 504}:
-                        base_delay = max(1.5, 6.0 / self.per_second)
+                        base_delay = max(1.5, 6.0 / self._get_session()._limiter.per_second)
                         delay = base_delay * (3**attempt)
                         delay += random.uniform(base_delay * 0.5, base_delay * 1.5)
                         logger.warning(
@@ -233,7 +233,7 @@ class AniListClient:
                 return data
 
             except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
-                base_delay = max(1.5, 6.0 / self.per_second)
+                base_delay = max(1.5, 6.0 / self._get_session()._limiter.per_second)
                 delay = base_delay * (3**attempt)
                 delay += random.uniform(base_delay * 0.5, base_delay * 1.5)
                 logger.warning(

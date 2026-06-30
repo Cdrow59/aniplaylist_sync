@@ -123,7 +123,7 @@ class MALClient:
                     text = await resp.text()
 
                     # scale delay with your rate limit
-                    base_delay = max(1.5, 6.0 / self.per_second)
+                    base_delay = max(1.5, 6.0 / self.session._limiter.per_second)
 
                     # exponential backoff (NO CAP)
                     delay = base_delay * (3**attempt)
@@ -159,7 +159,7 @@ class MALClient:
                 return json.loads(await resp.text())
 
             except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
-                base_delay = max(1.5, 6.0 / self.per_second)
+                base_delay = max(1.5, 6.0 / self.session._limiter.per_second)
                 delay = base_delay * (3**attempt)
                 delay += random.uniform(base_delay * 0.5, base_delay * 1.5)
 
