@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import aiohttp
-from ratelimit import MAL_DEFAULT_BURST, MAL_DEFAULT_JITTER_MAX, MAL_DEFAULT_JITTER_MIN, MAL_DEFAULT_RPS, RateLimiter
+from ratelimit import RateLimiter
 from rich.progress import Progress
 
 logger = logging.getLogger(__name__)
@@ -22,18 +22,12 @@ RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 class RateLimitedSession:
     """aiohttp session wrapped with a :class:`~ratelimit.RateLimiter`."""
 
-    def __init__(
-        self,
-        per_second: float = MAL_DEFAULT_RPS,
-        burst: int = MAL_DEFAULT_BURST,
-        jitter_min: float = MAL_DEFAULT_JITTER_MIN,
-        jitter_max: float = MAL_DEFAULT_JITTER_MAX,
-    ) -> None:
+    def __init__(self) -> None:
         self._session = aiohttp.ClientSession()
-        self._limiter = RateLimiter(per_second=per_second, name="MAL", burst=burst, jitter_min=jitter_min, jitter_max=jitter_max)
+        self._limiter = RateLimiter.from_preset("MAL")
 
     async def get(self, *args: object, **kwargs: object) -> object:
-        await self._limiter.acquire()
+        await self._limiter.acquire_async()
         return await self._session.get(*args, **kwargs)  # type: ignore[arg-type]
 
     async def close(self) -> None:
@@ -60,15 +54,13 @@ class MALClient:
     access_token: str | None = None
     redirect_uri: str | None = None
     base_url: str = "https://api.myanimelist.net/v2"
-    per_second: float = 1.0
     session: RateLimitedSession = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
-        self.session = RateLimitedSession(per_second=self.per_second)
+        self.session = RateLimitedSession()
         logger.debug(
-            "MALClient initialized — user=%r  rate_limit=%.2f/s  authenticated=%s",
+            "MALClient initialized — user=%r  authenticated=%s",
             self.username,
-            self.per_second,
             bool(self.access_token),
         )
 
@@ -85,13 +77,10 @@ class MALClient:
             raise RuntimeError("Missing required environment variable: MAL_CLIENT_ID")
         resolved_username = username or os.getenv("MAL_USERNAME", "").strip() or "@me"
         redirect_uri = os.getenv("MAL_REDIRECT_URI") or None
-        per_second_raw = os.getenv("MAL_RATE_LIMIT_PER_SECOND")
-        per_second = float(per_second_raw) if per_second_raw else 1.0
         return cls(
             client_id=client_id,
             username=resolved_username,
             redirect_uri=redirect_uri,
-            per_second=per_second,
             **kwargs,
         )
 

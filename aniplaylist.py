@@ -64,13 +64,7 @@ from dataclasses import dataclass, field
 from typing import TypedDict
 
 import aiohttp
-from ratelimit import (
-    ALGOLIA_DEFAULT_BURST,
-    ALGOLIA_DEFAULT_JITTER_MAX,
-    ALGOLIA_DEFAULT_JITTER_MIN,
-    ALGOLIA_DEFAULT_RPS,
-    AlgoliaLimiter,
-)
+from ratelimit import RateLimiter
 
 logger = logging.getLogger(__name__)
 
@@ -139,10 +133,8 @@ class AlgoliaClient:
     """Async client for the Algolia search index that backs aniplaylist.com.
 
     Args:
-        app_id:     Algolia application ID (``ALGOLIA_APP_ID`` env var).
-        api_key:    Algolia search-only API key (``ALGOLIA_API_KEY`` env var).
-        per_second: Maximum requests per second (default: ALGOLIA_DEFAULT_RPS).
-        burst:      Initial burst budget (default: ALGOLIA_DEFAULT_BURST).
+        app_id:  Algolia application ID (``ALGOLIA_APP_ID`` env var).
+        api_key: Algolia search-only API key (``ALGOLIA_API_KEY`` env var).
 
     Typical usage::
 
@@ -158,27 +150,16 @@ class AlgoliaClient:
 
     app_id: str
     api_key: str
-    per_second: float = ALGOLIA_DEFAULT_RPS
-    burst: int = ALGOLIA_DEFAULT_BURST
-    jitter_min: float = ALGOLIA_DEFAULT_JITTER_MIN
-    jitter_max: float = ALGOLIA_DEFAULT_JITTER_MAX
 
-    _limiter: AlgoliaLimiter = field(init=False, repr=False)
+    _limiter: RateLimiter = field(init=False, repr=False)
     _session: aiohttp.ClientSession = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
-        self._limiter = AlgoliaLimiter(
-            per_second=self.per_second,
-            burst=self.burst,
-            jitter_min=self.jitter_min,
-            jitter_max=self.jitter_max,
-        )
+        self._limiter = RateLimiter.from_preset("Algolia")
         self._session = aiohttp.ClientSession()
         logger.debug(
-            "AlgoliaClient initialised — app_id=%r  rate=%.1f/s  burst=%d",
+            "AlgoliaClient initialised — app_id=%r",
             self.app_id,
-            self.per_second,
-            self.burst,
         )
 
     # ------------------------------------------------------------------
@@ -186,12 +167,7 @@ class AlgoliaClient:
     # ------------------------------------------------------------------
 
     @classmethod
-    def from_env(
-        cls,
-        *,
-        per_second: float = ALGOLIA_DEFAULT_RPS,
-        burst: int = ALGOLIA_DEFAULT_BURST,
-    ) -> "AlgoliaClient":
+    def from_env(cls) -> "AlgoliaClient":
         """Create a client from ``ALGOLIA_APP_ID`` / ``ALGOLIA_API_KEY`` env vars.
 
         Raises ``RuntimeError`` if either variable is missing.
@@ -207,7 +183,7 @@ class AlgoliaClient:
             raise RuntimeError(
                 f"Missing required environment variable(s): {', '.join(missing)}"
             )
-        return cls(app_id=app_id, api_key=api_key, per_second=per_second, burst=burst)  # type: ignore[arg-type]
+        return cls(app_id=app_id, api_key=api_key)  # type: ignore[arg-type]
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -286,7 +262,7 @@ class AlgoliaClient:
 
         attempt = 0
         while True:
-            await self._limiter.acquire()
+            await self._limiter.acquire_async()
             logger.debug(
                 "%s Algolia page=%d query=%r attempt=%d",
                 mal_label,

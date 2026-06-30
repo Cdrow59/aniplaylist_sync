@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import aiohttp
-from ratelimit import ANILIST_DEFAULT_BURST, ANILIST_DEFAULT_JITTER_MAX, ANILIST_DEFAULT_JITTER_MIN, ANILIST_DEFAULT_RPS, RateLimiter
+from ratelimit import RateLimiter
 
 logger = logging.getLogger(__name__)
 
@@ -24,18 +24,12 @@ RETRYABLE_STATUS = {429, 500, 502, 503, 504}
 class RateLimitedSession:
     """aiohttp session wrapped with a :class:`~ratelimit.RateLimiter`."""
 
-    def __init__(
-        self,
-        per_second: float = ANILIST_DEFAULT_RPS,
-        burst: int = ANILIST_DEFAULT_BURST,
-        jitter_min: float = ANILIST_DEFAULT_JITTER_MIN,
-        jitter_max: float = ANILIST_DEFAULT_JITTER_MAX,
-    ) -> None:
+    def __init__(self) -> None:
         self._session = aiohttp.ClientSession()
-        self._limiter = RateLimiter(per_second=per_second, name="AniList", burst=burst, jitter_min=jitter_min, jitter_max=jitter_max)
+        self._limiter = RateLimiter.from_preset("AniList")
 
     async def post(self, *args: object, **kwargs: object) -> object:
-        await self._limiter.acquire()
+        await self._limiter.acquire_async()
         return await self._session.post(*args, **kwargs)  # type: ignore[arg-type]
 
     async def close(self) -> None:
@@ -79,15 +73,13 @@ class AniListClient:
     redirect_uri: str | None = None
     api_url: str = ANILIST_API
     auth_url: str = ANILIST_AUTH_URL
-    per_second: float = 1.0
     session: RateLimitedSession | None = field(init=False, repr=False, default=None)
     _token: str | None = field(init=False, repr=False, default=None)
 
     def __post_init__(self) -> None:
         logger.debug(
-            "AniListClient initialized — user=%r  rate_limit=%.2f/s  credentials=%s",
+            "AniListClient initialized — user=%r  credentials=%s",
             self.username,
-            self.per_second,
             bool(self.client_id and self.client_secret),
         )
 
@@ -120,20 +112,17 @@ class AniListClient:
                 "AniList username required — pass username= or set ANILIST_USERNAME"
             )
         redirect_uri = os.getenv("ANILIST_REDIRECT_URI") or None
-        per_second_raw = os.getenv("ANILIST_RATE_LIMIT_PER_SECOND")
-        per_second = float(per_second_raw) if per_second_raw else 1.0
         return cls(
             username=resolved_username,
             client_id=client_id,
             client_secret=client_secret,
             redirect_uri=redirect_uri,
-            per_second=per_second,
             **kwargs,
         )
 
     def _get_session(self) -> RateLimitedSession:
         if self.session is None:
-            self.session = RateLimitedSession(per_second=self.per_second)
+            self.session = RateLimitedSession()
         return self.session
 
     async def _ensure_token(self) -> str:

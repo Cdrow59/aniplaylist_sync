@@ -12,7 +12,7 @@ from typing import Any, Iterable
 
 import aiosqlite
 import spotipy
-from ratelimit import SPOTIFY_DEFAULT_BURST, SPOTIFY_DEFAULT_JITTER_MAX, SPOTIFY_DEFAULT_JITTER_MIN, SPOTIFY_DEFAULT_RPS, SyncRateLimiter
+from ratelimit import RateLimiter
 from rich.progress import Progress
 from spotipy.oauth2 import SpotifyOAuth
 
@@ -52,24 +52,14 @@ def _read_spotify_env(name: str) -> str:
 class RateLimitedSpotifyClient:
     """Wraps a spotipy.Spotify instance with per-second rate limiting.
 
-    Uses :class:`~ratelimit.SyncRateLimiter` internally so all rate-limit
+    Uses :class:`~ratelimit.RateLimiter` internally so all rate-limit
     logic lives in one place.  The actual spotipy calls run in a thread pool
     via ``asyncio.to_thread`` so the event loop is never blocked.
     """
 
-    def __init__(
-        self,
-        client: Any,
-        per_second: float = SPOTIFY_DEFAULT_RPS,
-        burst: int = SPOTIFY_DEFAULT_BURST,
-        jitter_min: float = SPOTIFY_DEFAULT_JITTER_MIN,
-        jitter_max: float = SPOTIFY_DEFAULT_JITTER_MAX,
-    ) -> None:
+    def __init__(self, client: Any) -> None:
         self._client = client
-        self._limiter = SyncRateLimiter(
-            per_second=per_second, name="Spotify", burst=burst,
-            jitter_min=jitter_min, jitter_max=jitter_max,
-        )
+        self._limiter = RateLimiter.from_preset("Spotify")
 
     @classmethod
     def from_env(cls, **kwargs) -> "RateLimitedSpotifyClient":
@@ -87,7 +77,7 @@ class RateLimitedSpotifyClient:
             redirect_uri=_read_spotify_env("SPOTIPY_REDIRECT_URI"),
             scope="playlist-modify-private playlist-modify-public",
         )
-        return cls(spotipy.Spotify(auth_manager=auth), **kwargs)
+        return cls(spotipy.Spotify(auth_manager=auth))
 
     async def _call(self, fn, *args, **kwargs):
         # Acquire inside the thread so the event loop isn't blocked by sleep.
