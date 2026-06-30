@@ -3,4 +3,3 @@ aiohttp
 networkx
 python-dotenv
 rich
-spotipy
