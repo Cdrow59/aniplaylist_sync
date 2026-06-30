@@ -302,14 +302,61 @@ async def _search_one(
     return results, attempt_logs, True
 
 
+def _result_to_dict(r: SearchResult) -> dict:
+    return {
+        "anime_title": r.anime_title,
+        "song_type": r.song_type,
+        "sequence": r.sequence,
+        "title": r.title,
+        "artists": r.artists,
+        "spotify_link": r.spotify_link,
+        "matched_query": r.matched_query,
+        "source_index": r.source_index,
+        "advanced_attempted": r.advanced_attempted,
+        "advanced_synonyms": r.advanced_synonyms,
+        "advanced_matched_synonym": r.advanced_matched_synonym,
+        "advanced_error": r.advanced_error,
+    }
+
+
+def _write_entry_json(
+    json_dir: Path,
+    mal_id: int,
+    title: str,
+    used_query: str,
+    results: list[SearchResult],
+    attempt_logs: list[dict],
+) -> None:
+    safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in title)[:60]
+    path = json_dir / f"{mal_id}_{safe}.json"
+    payload = {
+        "mal_id": mal_id,
+        "mal_title": title,
+        "used_query": used_query,
+        "attempt_logs": attempt_logs,
+        "results": [_result_to_dict(r) for r in results],
+    }
+    try:
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        logger.debug("Wrote JSON — %s", path)
+    except OSError as exc:
+        logger.warning("Failed to write JSON for MAL:%d: %s", mal_id, exc)
+
+
 async def run_aniplaylist_stage(
     db_path: Path,
     mal_entries: list[MALAnimeEntry],
     *,
     algolia: AlgoliaClient,
     exact_filter: bool,
+    emit_json: bool,
     progress: Progress,
 ) -> list[dict[str, object]]:
+    json_dir: Path | None = None
+    if emit_json:
+        json_dir = Path("debug/json")
+        json_dir.mkdir(parents=True, exist_ok=True)
+
     summary: list[dict[str, object]] = []
     task_id = progress.add_task("AniPlaylist", total=len(mal_entries))
 
@@ -441,6 +488,16 @@ async def run_aniplaylist_stage(
             english_title=english_title,
             japanese_title=japanese_title,
         )
+
+        if emit_json and json_dir is not None:
+            _write_entry_json(
+                json_dir,
+                mal_id=entry.mal_id,
+                title=entry.title,
+                used_query=used_query,
+                results=results,
+                attempt_logs=all_attempt_logs,
+            )
 
         summary.append(
             {
@@ -576,6 +633,7 @@ async def run_main_pipeline(args) -> list[dict[str, object]]:
                     entries,
                     algolia=algolia,
                     exact_filter=not args.no_exact_filter,
+                    emit_json=args.json,
                     progress=progress,
                 )
             )
@@ -614,7 +672,7 @@ async def _run_impl(args) -> None:
     summary = await run_main_pipeline(args)
 
     if args.json:
-        print(json.dumps(summary, ensure_ascii=False, indent=2))
+        logger.info("JSON output written to debug/json/")
 
     if args.dry_run:
         logger.info("Dry run — skipping Spotify stage")
