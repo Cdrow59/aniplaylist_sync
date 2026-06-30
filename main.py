@@ -166,7 +166,9 @@ async def _search_one(
     # ── Pass 1: fetch all hits, match on primary anime title ─────────────
     logger.info("%s Searching — query=%r", ctx, title_query)
     try:
-        scrape_result = await algolia.scrape(title_query, mal_label=ctx, raw_log=raw_log)
+        scrape_result = await algolia.scrape(
+            title_query, mal_label=ctx, raw_log=raw_log
+        )
     except (RuntimeError, ValueError, OSError) as exc:
         logger.warning("%s Search failed for query=%r: %s", ctx, title_query, exc)
         attempt_logs.append(
@@ -202,6 +204,7 @@ async def _search_one(
 
     if matched or not exact_filter:
         results = matched if exact_filter else raw_results
+        results = [r for r in results if r.spotify_link]
         if results:
             logger.debug(
                 "%s Matched %d result(s) on primary title — done",
@@ -301,6 +304,7 @@ async def _search_one(
     )
 
     results = matched2 if exact_filter else raw_results2
+    results = [r for r in results if r.spotify_link]
     return results, attempt_logs, True
 
 
@@ -363,7 +367,9 @@ def _write_entry_json(
         "results": [_result_to_dict(r) for r in results],
     }
     try:
-        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
         logger.debug("Wrote JSON — %s", path)
     except OSError as exc:
         logger.warning("Failed to write JSON for MAL:%d: %s", mal_id, exc)

@@ -1,35 +1,3 @@
-"""ratelimit.py — shared async/sync rate-limiter for all API clients.
-
-Provides:
-    RateLimiter        — async token-bucket for aiohttp sessions (MAL, AniList)
-    SyncRateLimiter    — sync token-bucket for spotipy (Spotify)
-    AniPlaylistLimiter — inter-scrape delay guard for Playwright scraper
-
-Usage
------
-    # Async (MAL, AniList)
-    limiter = RateLimiter(per_second=1.0, name="MAL")
-    await limiter.acquire()          # blocks until a slot is available
-    resp = await session.get(url)
-
-    # Sync (Spotify)
-    limiter = SyncRateLimiter(per_second=5.0, name="Spotify")
-    limiter.acquire()
-    result = spotify_client.search(...)
-
-    # AniPlaylist scrape throttle
-    limiter = AniPlaylistLimiter(per_scrape=0.5)   # 0.5 scrapes/s = 2 s gap
-    await limiter.acquire()
-    result = await scrape(query)
-
-Rate-limit defaults (can be overridden via env vars or constructor args):
-    MAL         1 req/s   — conservative; MAL enforces ~3 req/s but docs say 1
-    AniList     1 req/s   — public limit is ~90 req/min with 429 back-off
-    Spotify     5 req/s   — spotipy handles 429s but we stay below the ceiling
-    AniPlaylist 0.5 scrapes/s (= 2 s between full scrapes) — Playwright overhead
-                           already pads naturally; this is a safety floor
-"""
-
 from __future__ import annotations
 
 import asyncio
@@ -40,49 +8,31 @@ import time
 
 logger = logging.getLogger(__name__)
 
-# Default rates — edit here to tune globally, or override per-client in main.py
-MAL_DEFAULT_RPS: float = 1.0  # MAL docs: ~3 req/s; 1.0 is conservative
-ANILIST_DEFAULT_RPS: float = 1.0  # AniList: ~90 req/min; 1.0 ≈ 60 req/min
-SPOTIFY_DEFAULT_RPS: float = 2.0  # spotipy handles 429s; 5.0 stays well under
-ALGOLIA_DEFAULT_RPS: float = 0.25  # 5 req/s — well under Algolia's ceiling
-
-# Default burst budgets — number of requests allowed with no delay at startup
-MAL_DEFAULT_BURST: int = 1
-ANILIST_DEFAULT_BURST: int = 1
-SPOTIFY_DEFAULT_BURST: int = 1
-ALGOLIA_DEFAULT_BURST: int = 1  # allow a small burst on first search
-
-# Random Jitter Min
-MAL_DEFAULT_JITTER_MIN: int = 0
-ANILIST_DEFAULT_JITTER_MIN: int = 0
-SPOTIFY_DEFAULT_JITTER_MIN: int = 0
-ALGOLIA_DEFAULT_JITTER_MIN: int = 0.1
-
-# Random Jitter Max
-MAL_DEFAULT_JITTER_MAX: int = 0
-ANILIST_DEFAULT_JITTER_MAX: int = 0
-SPOTIFY_DEFAULT_JITTER_MAX: int = 0
-ALGOLIA_DEFAULT_JITTER_MAX: int = 1
 # ---------------------------------------------------------------------------
-# Async rate limiter (MAL, AniList)
+# Global Default Configuration Budgets
 # ---------------------------------------------------------------------------
+DEFAULTS = {
+    "MAL": {"per_second": 1.0, "burst": 1, "jitter_min": 0.0, "jitter_max": 0.0},
+    "AniList": {"per_second": 1.0, "burst": 1, "jitter_min": 0.0, "jitter_max": 0.0},
+    "Spotify": {"per_second": 2.0, "burst": 1, "jitter_min": 0.0, "jitter_max": 0.0},
+    "Algolia": {"per_second": 0.25, "burst": 1, "jitter_min": 0.1, "jitter_max": 1.0},
+    "AniPlaylist": {
+        "per_second": 0.5,
+        "burst": 1,
+        "jitter_min": 0.0,
+        "jitter_max": 0.0,
+    },
+}
 
 
+# ---------------------------------------------------------------------------
+# Unified Rate Limiter Class
+# ---------------------------------------------------------------------------
 class RateLimiter:
-    """Async token-bucket rate limiter.
+    """Unified Thread-safe and Async-safe token-bucket rate limiter.
 
-    A single asyncio.Lock serialises callers so no two requests can slip
-    through simultaneously even under high concurrency.  The delay is
-    computed from the *actual* time of the last release, not the scheduled
-    time, so accumulated slack is never gifted to the next caller.
-
-    Args:
-        per_second: Maximum sustained request rate (requests / second).
-                    Fractional values are fine: 0.5 → one request every 2 s.
-        name:       Label included in debug log lines.
-        burst:      Number of requests allowed without delay at startup
-                    (default 1 — no burst).  Useful when an API allows a
-                    small initial burst before the steady-state window kicks in.
+    Uses a single threading.Lock and time.monotonic() to accurately control
+    execution speed across both synchronous threads and asynchronous loops.
     """
 
     def __init__(
@@ -105,7 +55,8 @@ class RateLimiter:
         self.jitter_min = jitter_min
         self.jitter_max = jitter_max
         self._min_interval = 1.0 / per_second
-        self._lock = asyncio.Lock()
+
+        self._lock = threading.Lock()
         self._last_release: float = 0.0
         self._burst_remaining: int = burst
 
@@ -119,165 +70,57 @@ class RateLimiter:
             jitter_max,
         )
 
-    async def acquire(self) -> None:
-        """Wait until a request slot is available, then return."""
-        async with self._lock:
-            if self._burst_remaining > 0:
-                self._burst_remaining -= 1
-                self._last_release = asyncio.get_running_loop().time()
-                logger.debug(
-                    "RateLimiter[%s] burst slot used (%d remaining)",
-                    self.name,
-                    self._burst_remaining,
-                )
-                return
-
-            now = asyncio.get_running_loop().time()
-            wait = self._min_interval - (now - self._last_release)
-            if self.jitter_max > 0:
-                wait += random.uniform(self.jitter_min, self.jitter_max)
-            if wait > 0:
-                logger.debug("RateLimiter[%s] sleeping %.3fs", self.name, wait)
-                await asyncio.sleep(wait)
-            self._last_release = asyncio.get_running_loop().time()
-
-    # ------------------------------------------------------------------
-    # Convenience: wrap an aiohttp session method
-    # ------------------------------------------------------------------
-
-    async def get(self, session: object, *args: object, **kwargs: object) -> object:
-        """Acquire a slot then call ``session.get(*args, **kwargs)``."""
-        await self.acquire()
-        return await session.get(*args, **kwargs)  # type: ignore[attr-defined]
-
-    async def post(self, session: object, *args: object, **kwargs: object) -> object:
-        """Acquire a slot then call ``session.post(*args, **kwargs)``."""
-        await self.acquire()
-        return await session.post(*args, **kwargs)  # type: ignore[attr-defined]
-
-
-# ---------------------------------------------------------------------------
-# Sync rate limiter (Spotify / spotipy)
-# ---------------------------------------------------------------------------
-
-
-class SyncRateLimiter:
-    """Thread-safe synchronous token-bucket rate limiter for spotipy.
-
-    Identical semantics to :class:`RateLimiter` but uses ``threading.Lock``
-    and ``time.monotonic`` so it works outside an async event loop.
-
-    Args:
-        per_second: Maximum sustained request rate.
-        name:       Label for log lines.
-        burst:      Burst budget (see :class:`RateLimiter`).
-    """
-
-    def __init__(
-        self,
-        per_second: float = 5.0,
-        *,
-        name: str = "unnamed-sync",
-        burst: int = 1,
-        jitter_min: float = 0.0,
-        jitter_max: float = 0.0,
-    ) -> None:
-        if per_second <= 0:
-            raise ValueError(f"per_second must be > 0, got {per_second!r}")
-
-        self.per_second = per_second
-        self.name = name
-        self.burst = burst
-        self.jitter_min = jitter_min
-        self.jitter_max = jitter_max
-        self._min_interval = 1.0 / per_second
-        self._lock = threading.Lock()
-        self._last_release: float = 0.0
-        self._burst_remaining: int = burst
-
-        logger.info(
-            "SyncRateLimiter[%s] created — %.3f req/s  interval=%.3fs  burst=%d  jitter=[%.3f, %.3f]",
-            name,
-            per_second,
-            self._min_interval,
-            burst,
-            jitter_min,
-            jitter_max,
+    @classmethod
+    def from_preset(cls, name: str) -> RateLimiter:
+        """Convenience constructor to build a limiter using predefined target defaults."""
+        config = DEFAULTS.get(
+            name, {"per_second": 1.0, "burst": 1, "jitter_min": 0.0, "jitter_max": 0.0}
         )
+        return cls(name=name, **config)
 
-    def acquire(self) -> None:
-        """Block until a request slot is available."""
+    def _compute_wait(self) -> float:
+        """Internal helper to calculate wait time and safely update timestamps."""
         with self._lock:
             if self._burst_remaining > 0:
                 self._burst_remaining -= 1
                 self._last_release = time.monotonic()
-                return
+                return 0.0
 
             now = time.monotonic()
             wait = self._min_interval - (now - self._last_release)
             if self.jitter_max > 0:
                 wait += random.uniform(self.jitter_min, self.jitter_max)
+
             if wait > 0:
-                logger.debug("SyncRateLimiter[%s] sleeping %.3fs", self.name, wait)
-                time.sleep(wait)
-            self._last_release = time.monotonic()
+                self._last_release = now + wait
+            else:
+                self._last_release = now
+                wait = 0.0
+            return wait
 
+    def acquire(self) -> None:
+        """Block the current thread until a request slot is available (Synchronous)."""
+        wait = self._compute_wait()
+        if wait > 0:
+            logger.debug("RateLimiter[%s] sync sleeping %.3fs", self.name, wait)
+            time.sleep(wait)
 
-# ---------------------------------------------------------------------------
-# Algolia API rate limiter
-# ---------------------------------------------------------------------------
+    async def acquire_async(self) -> None:
+        """Yield control to the event loop until a slot is available (Asynchronous)."""
+        wait = self._compute_wait()
+        if wait > 0:
+            logger.debug("RateLimiter[%s] async sleeping %.3fs", self.name, wait)
+            await asyncio.sleep(wait)
 
+    # ------------------------------------------------------------------
+    # aiohttp Session Wrappers
+    # ------------------------------------------------------------------
+    async def get(self, session: object, *args: object, **kwargs: object) -> object:
+        """Acquire an async slot then call ``session.get(*args, **kwargs)``."""
+        await self.acquire_async()
+        return await session.get(*args, **kwargs)  # type: ignore[attr-defined]
 
-class AlgoliaLimiter:
-    """Async rate limiter for Algolia search API requests.
-
-    Algolia's public search-only keys are very permissive, but we throttle
-    to ``ALGOLIA_DEFAULT_RPS`` (5 req/s) to be a polite client and avoid
-    any anti-scraping measures on aniplaylist.com's side.
-
-    A small burst budget (default 3) lets the first page-0 + concurrent
-    page fetches proceed without artificial delays on startup.
-
-    Args:
-        per_second: Maximum requests per second (default 5.0).
-        name:       Label for log lines.
-        burst:      Initial burst budget (default 3).
-    """
-
-    def __init__(
-        self,
-        per_second: float = ALGOLIA_DEFAULT_RPS,
-        *,
-        name: str = "Algolia",
-        burst: int = ALGOLIA_DEFAULT_BURST,
-        jitter_min: float = ALGOLIA_DEFAULT_JITTER_MIN,
-        jitter_max: float = ALGOLIA_DEFAULT_JITTER_MAX,
-    ) -> None:
-        if per_second <= 0:
-            raise ValueError(f"per_second must be > 0, got {per_second!r}")
-        self._inner = RateLimiter(
-            per_second=per_second,
-            name=name,
-            burst=burst,
-            jitter_min=jitter_min,
-            jitter_max=jitter_max,
-        )
-        logger.debug(
-            "AlgoliaLimiter[%s] created — %.1f req/s  interval=%.3fs  burst=%d",
-            name,
-            per_second,
-            1.0 / per_second,
-            burst,
-        )
-
-    async def acquire(self) -> None:
-        """Wait until a request slot is available."""
-        await self._inner.acquire()
-
-    @property
-    def per_second(self) -> float:
-        return self._inner.per_second
-
-    @property
-    def name(self) -> str:
-        return self._inner.name
+    async def post(self, session: object, *args: object, **kwargs: object) -> object:
+        """Acquire an async slot then call ``session.post(*args, **kwargs)``."""
+        await self.acquire_async()
+        return await session.post(*args, **kwargs)  # type: ignore[attr-defined]
