@@ -18,7 +18,7 @@ from rich.progress import (
     TimeElapsedColumn,
     TimeRemainingColumn,
 )
-from rich.prompt import Confirm, Prompt
+from rich.prompt import Confirm
 
 from anilist import AniListClient
 from aniplaylist import AlgoliaClient, ScrapeResult
@@ -153,25 +153,21 @@ async def _search_one(
     title_query: str,
     exact_titles: list[str],
     exact_filter: bool,
-    headed: bool,
     *,
     algolia: AlgoliaClient,
     mal_id: int,
     mal_title: str,
-    save_html: bool,
     allow_pass2: bool = True,
 ) -> tuple[list[SearchResult], list[dict], bool]:
     ctx = f"[MAL:{mal_id} '{mal_title}']"
     attempt_logs: list[dict] = []
 
-    # ── Pass 1: static data only ──────────────────────────────────────────
-    logger.info("%s Pass 1 — querying '%s'", ctx, title_query)
+    # ── Pass 1: fetch all hits, match on primary anime title ─────────────
+    logger.info("%s Searching — query=%r", ctx, title_query)
     try:
-        scrape_result = await algolia.scrape(
-            title_query, headless=not headed, mal_label=ctx
-        )
+        scrape_result = await algolia.scrape(title_query, mal_label=ctx)
     except (RuntimeError, ValueError, OSError) as exc:
-        logger.warning("%s Pass 1 failed for query '%s': %s", ctx, title_query, exc)
+        logger.warning("%s Search failed for query=%r: %s", ctx, title_query, exc)
         attempt_logs.append(
             {
                 "pass": 1,
@@ -183,11 +179,11 @@ async def _search_one(
         )
         return [], attempt_logs, False
 
-    raw_results = parse(scrape_result, exact_titles=exact_titles, save_html=save_html)
+    raw_results = parse(scrape_result, exact_titles=exact_titles)
     matched = [r for r in raw_results if r.matched_query]
 
     logger.info(
-        "%s Pass 1 done — query='%s'  cards=%d  matched=%d",
+        "%s Search done — query=%r  hits=%d  matched=%d",
         ctx,
         title_query,
         len(raw_results),
@@ -207,13 +203,13 @@ async def _search_one(
         results = matched if exact_filter else raw_results
         if results:
             logger.debug(
-                "%s Pass 1 matched %d result(s) — skipping portal phase",
+                "%s Matched %d result(s) on primary title — done",
                 ctx,
                 len(results),
             )
         return results, attempt_logs, True
 
-    # ── Pass 2: open portals for unmatched cards only ─────────────────────
+    # ── Pass 2: re-fetch with alternate titles as synonyms ────────────────
     unmatched_indices = {
         r.source_index
         for r in raw_results
@@ -221,20 +217,19 @@ async def _search_one(
     }
 
     if not unmatched_indices:
-        logger.info("%s Pass 1 returned no cards — nothing to escalate", ctx)
+        logger.info("%s No hits returned — nothing to escalate", ctx)
         return [], attempt_logs, True
 
     if not allow_pass2:
         logger.debug(
-            "%s Pass 2 deferred — %d unmatched card(s), will retry after all Pass 1 candidates exhausted",
+            "%s Synonym check deferred — %d unmatched hit(s), will retry after all queries exhausted",
             ctx,
             len(unmatched_indices),
         )
         return [], attempt_logs, True
 
     logger.warning(
-        "%s Pass 1 found no title match across %d card(s) — "
-        "escalating to Pass 2 (portal synonym check) for indices %s",
+        "%s No title match across %d hit(s) — escalating to synonym check for indices %s",
         ctx,
         len(raw_results),
         sorted(unmatched_indices),
@@ -243,14 +238,11 @@ async def _search_one(
     try:
         scrape_result2 = await algolia.scrape(
             title_query,
-            headless=not headed,
             fetch_portal_indices=unmatched_indices,
             mal_label=ctx,
         )
     except (RuntimeError, ValueError, OSError) as exc:
-        logger.error(
-            "%s Pass 2 scrape failed for query '%s': %s", ctx, title_query, exc
-        )
+        logger.error("%s Synonym fetch failed for query=%r: %s", ctx, title_query, exc)
         attempt_logs.append(
             {
                 "pass": 2,
@@ -262,69 +254,38 @@ async def _search_one(
         )
         return [], attempt_logs, True
 
-    raw_results2 = parse(scrape_result2, exact_titles=exact_titles, save_html=save_html)
+    raw_results2 = parse(scrape_result2, exact_titles=exact_titles)
     matched2 = [r for r in raw_results2 if r.matched_query]
 
-    advanced_card_checks = [
-        {
-            "source_index": r.source_index,
-            "anime_title": r.anime_title,
-            "matched_query": r.matched_query,
-            "matched_synonym": r.advanced_matched_synonym,
-            "synonyms": r.advanced_synonyms or [],
-            "advanced_error": r.advanced_error,
-        }
-        for r in raw_results2
-        if r.advanced_attempted
-    ]
-
     if matched2:
-        for r in raw_results2:
-            if r.matched_query and r.advanced_matched_synonym:
+        for r in matched2:
+            if r.advanced_matched_synonym:
                 logger.info(
-                    "%s Pass 2 matched via synonym '%s' on card %s ('%s')",
+                    "%s Synonym match — hit=%r synonym=%r index=%s",
                     ctx,
+                    r.anime_title,
                     r.advanced_matched_synonym,
                     r.source_index,
-                    r.anime_title,
                 )
         logger.info(
-            "%s Pass 2 done — query='%s'  portals_opened=%d  matched=%d",
+            "%s Synonym check done — query=%r  matched=%d",
             ctx,
             title_query,
-            len(unmatched_indices),
             len(matched2),
         )
     else:
-        for check in advanced_card_checks:
-            if check["advanced_error"]:
-                logger.warning(
-                    "%s Pass 2 card %s ('%s') portal error: %s",
-                    ctx,
-                    check["source_index"],
-                    check["anime_title"],
-                    check["advanced_error"],
-                )
-            elif check["synonyms"]:
+        for r in raw_results2:
+            if r.advanced_attempted and r.advanced_synonyms:
                 logger.debug(
-                    "%s Pass 2 card %s ('%s') synonyms checked: %s — no match",
+                    "%s Index %s synonyms checked — no match: %s",
                     ctx,
-                    check["source_index"],
-                    check["anime_title"],
-                    check["synonyms"],
-                )
-            else:
-                logger.debug(
-                    "%s Pass 2 card %s ('%s') — no synonyms in portal",
-                    ctx,
-                    check["source_index"],
-                    check["anime_title"],
+                    r.source_index,
+                    r.advanced_synonyms,
                 )
         logger.warning(
-            "%s Pass 2 exhausted — query='%s'  portals_opened=%d  no match found",
+            "%s Synonym check exhausted — query=%r  no match",
             ctx,
             title_query,
-            len(unmatched_indices),
         )
 
     attempt_logs.append(
@@ -333,7 +294,6 @@ async def _search_one(
             "query": title_query,
             "result_count": len(raw_results2),
             "matched_count": len(matched2),
-            "advanced_card_checks": advanced_card_checks,
             "error": None,
         }
     )
@@ -347,10 +307,7 @@ async def run_aniplaylist_stage(
     mal_entries: list[MALAnimeEntry],
     *,
     algolia: AlgoliaClient,
-    headed: bool,
     exact_filter: bool,
-    emit_json: bool,
-    save_html: bool,
     progress: Progress,
 ) -> list[dict[str, object]]:
     summary: list[dict[str, object]] = []
@@ -369,25 +326,23 @@ async def run_aniplaylist_stage(
         used_query = titles_to_try[0] if titles_to_try else entry.title
         all_attempt_logs: list[dict] = []
         any_scrape_succeeded = False
-        total_cards_seen = 0
+        total_hits_seen = 0
 
         for title_query in titles_to_try:
             results, attempt_logs, succeeded = await _search_one(
                 title_query,
                 exact_titles,
                 exact_filter,
-                headed,
                 algolia=algolia,
                 mal_id=entry.mal_id,
                 mal_title=entry.title,
                 allow_pass2=False,
-                save_html=save_html,
             )
             all_attempt_logs.extend(attempt_logs)
-            total_cards_seen += sum(log.get("result_count", 0) for log in attempt_logs)
+            total_hits_seen += sum(log.get("result_count", 0) for log in attempt_logs)
 
             if not succeeded:
-                logger.warning("%s Query '%s' failed", ctx, title_query)
+                logger.warning("%s Query %r failed — skipping", ctx, title_query)
                 continue
 
             any_scrape_succeeded = True
@@ -397,14 +352,14 @@ async def run_aniplaylist_stage(
                 break
             else:
                 logger.debug(
-                    "%s Query '%s' returned cards but no match — trying next title candidate",
+                    "%s Query %r returned hits but no match — trying next candidate",
                     ctx,
                     title_query,
                 )
 
         if not results:
             logger.info(
-                "%s All Pass 1 candidates exhausted — retrying with portal synonym checks",
+                "%s All queries exhausted — retrying with synonym checks",
                 ctx,
             )
             for title_query in titles_to_try:
@@ -412,20 +367,18 @@ async def run_aniplaylist_stage(
                     title_query,
                     exact_titles,
                     exact_filter,
-                    headed,
                     algolia=algolia,
                     mal_id=entry.mal_id,
                     mal_title=entry.title,
                     allow_pass2=True,
-                    save_html=save_html,
                 )
                 all_attempt_logs.extend(attempt_logs)
-                total_cards_seen += sum(
+                total_hits_seen += sum(
                     log.get("result_count", 0) for log in attempt_logs
                 )
 
                 if not succeeded:
-                    logger.warning("%s Query '%s' failed", ctx, title_query)
+                    logger.warning("%s Query %r failed — skipping", ctx, title_query)
                     continue
 
                 any_scrape_succeeded = True
@@ -435,7 +388,7 @@ async def run_aniplaylist_stage(
                     break
                 else:
                     logger.debug(
-                        "%s Query '%s' portal check found no match — trying next title candidate",
+                        "%s Query %r synonym check found no match — trying next candidate",
                         ctx,
                         title_query,
                     )
@@ -443,7 +396,7 @@ async def run_aniplaylist_stage(
         if results:
             matched_count = sum(1 for r in results if r.matched_query)
             logger.debug(
-                "%s Done — query='%s'  results=%d  matched=%d",
+                "%s Done — query=%r  results=%d  matched=%d",
                 ctx,
                 used_query,
                 len(results),
@@ -452,23 +405,23 @@ async def run_aniplaylist_stage(
         else:
             if not any_scrape_succeeded:
                 failure_type = FAILURE_SCRAPE_ERROR
-            elif total_cards_seen == 0:
+            elif total_hits_seen == 0:
                 failure_type = FAILURE_NOT_FOUND
             else:
                 failure_type = FAILURE_NO_MATCH
 
             logger.warning(
-                "%s No results — failure_type=%r  cards_seen=%d  tried=%s",
+                "%s No results — failure_type=%r  hits_seen=%d  tried=%s",
                 ctx,
                 failure_type,
-                total_cards_seen,
+                total_hits_seen,
                 titles_to_try,
             )
             await save_failure(
                 db_path,
                 failure_type=failure_type,
                 tried_queries=titles_to_try,
-                cards_seen=total_cards_seen,
+                cards_seen=total_hits_seen,
                 mal_id=entry.mal_id,
                 native_title=native_title,
                 english_title=english_title,
@@ -511,15 +464,14 @@ async def run_aniplaylist_stage(
 async def run(args) -> None:
     timeout_seconds = args.timeout or None
     logger.info(
-        f"Starting sync with timeout of {timeout_seconds}s"
-        if timeout_seconds
-        else f"Starting sync without timeout."
+        "Starting sync — timeout=%s",
+        f"{timeout_seconds}s" if timeout_seconds else "none",
     )
     try:
         async with asyncio.timeout(timeout_seconds):
             await _run_impl(args)
     except asyncio.TimeoutError:
-        logger.error(f"Sync operation timed out after {timeout_seconds}s")
+        logger.error("Sync timed out after %ss", timeout_seconds)
         raise
     else:
         logger.info("Sync completed successfully")
@@ -541,12 +493,12 @@ async def run_spotify_stage_if_needed(
     progress: Progress,
 ) -> None:
     if args.dry_run:
-        logger.info("Dry run enabled — skipping Spotify stage")
+        logger.info("Dry run — skipping Spotify stage")
         return
 
     if args.confirm:
         if not Confirm.ask("\nRun Spotify?", console=console):
-            logger.info("Spotify stage skipped — user declined confirmation")
+            logger.info("Spotify stage skipped — user declined")
             return
 
     await run_spotify_stage(
@@ -560,10 +512,7 @@ async def run_cached_mode(args) -> None:
     logger.info("Cached mode — skipping MAL fetch and AniPlaylist scrape")
 
     with create_progress() as progress:
-        await run_spotify_stage_if_needed(
-            args,
-            progress,
-        )
+        await run_spotify_stage_if_needed(args, progress)
 
 
 def create_client(args) -> tuple[
@@ -607,17 +556,10 @@ async def run_main_pipeline(args) -> list[dict[str, object]]:
                 entries = entries[: args.limit]
 
             if not entries:
-                logger.error(
-                    "No %s anime entries found!!",
-                    source_label,
-                )
+                logger.error("No %s anime entries found", source_label)
                 return []
 
-            logger.info(
-                "Proceeding with %d %s entries",
-                len(entries),
-                source_label,
-            )
+            logger.info("Proceeding with %d %s entries", len(entries), source_label)
 
             series_task = asyncio.create_task(
                 run_series_stage(
@@ -633,10 +575,7 @@ async def run_main_pipeline(args) -> list[dict[str, object]]:
                     args.db,
                     entries,
                     algolia=algolia,
-                    headed=args.headed,
                     exact_filter=not args.no_exact_filter,
-                    emit_json=args.json,
-                    save_html=args.save_html,
                     progress=progress,
                 )
             )
@@ -658,11 +597,7 @@ async def run_main_pipeline(args) -> list[dict[str, object]]:
         try:
             await client.close()
         except Exception as exc:
-            logger.warning(
-                "Error closing %s client: %s",
-                source_label,
-                exc,
-            )
+            logger.warning("Error closing %s client: %s", source_label, exc)
         try:
             await algolia.close()
         except Exception as exc:
@@ -678,17 +613,16 @@ async def _run_impl(args) -> None:
 
     summary = await run_main_pipeline(args)
 
-    # Progress context is fully DEAD here
     if args.json:
         print(json.dumps(summary, ensure_ascii=False, indent=2))
 
     if args.dry_run:
-        logger.info("Dry run enabled — skipping Spotify stage")
+        logger.info("Dry run — skipping Spotify stage")
         return
 
     if args.confirm:
         if not Confirm.ask("Run Spotify?", console=console):
-            logger.info("Spotify stage skipped — user declined confirmation")
+            logger.info("Spotify stage skipped — user declined")
             return
 
     with create_progress() as progress:

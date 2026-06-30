@@ -6,13 +6,10 @@ Public API
     records = parse(scrape_result, exact_titles=["Naruto", ...])
 
 portal_data key presence:
-    absent   — portal was never requested for this card (Phase 1-only scrape)
-               → advanced_* fields left at defaults, no attempt recorded
-    None     — portal requested but all retries failed
-               → advanced_attempted=True, advanced_error set
-    {}       — portal requested, info button not found
-               → no advanced attempt recorded
-    {synonyms, ...}  — extracted; synonym matching applied
+    absent       — portal was never requested for this result
+                   → advanced_* fields left at defaults
+    {synonyms}   — alternate anime titles returned by Algolia directly;
+                   synonym matching applied
 """
 
 from __future__ import annotations
@@ -21,15 +18,11 @@ import logging
 import re
 import unicodedata
 from dataclasses import dataclass
-from datetime import datetime
-from pathlib import Path
 from typing import Iterable
 
 from aniplaylist import BasicData, ResultItem, ScrapeResult
 
 logger = logging.getLogger(__name__)
-
-_SENTINEL = object()  # distinguishes key-absent from key=None
 
 
 # ---------------------------------------------------------------------------
@@ -94,7 +87,6 @@ _PUNCT_REPLACEMENTS: dict[str, str] = {
 _SUFFIX_RE = re.compile(r"\s*\((tv|ona|ova|movie|special)\)\s*$", re.IGNORECASE)
 _PUNCT_RE = re.compile("[" + re.escape("".join(_PUNCT_REPLACEMENTS)) + "]")
 _WHITESPACE = re.compile(r"\s+")
-_TRAILING_DIGITS = re.compile(r"\d+$")
 _TOKEN_RE = re.compile(r"[^\w]+")
 
 
@@ -136,10 +128,6 @@ def parse_song_type(basic: "BasicData") -> tuple[str, int | None]:
     return kind, seq
 
 
-def parse_synonyms(raw: str) -> list[str]:
-    return dedup(raw.split(","))
-
-
 # ---------------------------------------------------------------------------
 # Synonym scoring
 # ---------------------------------------------------------------------------
@@ -154,18 +142,7 @@ def _synonym_score(synonym: str, query_tokens: set[str]) -> tuple[int, int]:
     """
     Score a synonym for preference when multiple synonyms match exact_keys.
 
-    Returns a tuple (overlap, length) — both higher is better, so sort
-    descending on this tuple.
-
-    overlap : int
-        Number of tokens shared between the normalized synonym and the
-        normalized query that was actually searched.  A synonym that shares
-        more tokens with the query is more specific to this entry (e.g.
-        includes "Part 2" or "2nd Season") and should be preferred.
-
-    length : int
-        Character length of the normalized synonym, used as a tiebreaker.
-        Longer = more specific title = preferred over a short base-series alias.
+    Returns (overlap, length) — both higher is better, sort descending.
     """
     norm = normalize_for_match(synonym)
     overlap = len(_tokenize(norm) & query_tokens)
@@ -178,20 +155,13 @@ def _best_matching_synonym(
     query: str,
 ) -> str | None:
     """
-    Return the synonym from *synonyms* that:
-      1. Normalizes to a key present in *exact_keys* (i.e. is a valid match)
-      2. Among all valid matches, has the highest token overlap with *query*
-         (tiebroken by synonym length, longer preferred)
-
-    Returns None if no synonym matches.
+    Return the synonym from *synonyms* that normalizes to a key in *exact_keys*,
+    preferring the one with the most token overlap with *query*.
     """
     query_tokens = _tokenize(normalize_for_match(query))
-
     candidates = [s for s in synonyms if normalize_for_match(s) in exact_keys]
-
     if not candidates:
         return None
-
     return max(candidates, key=lambda s: _synonym_score(s, query_tokens))
 
 
@@ -212,10 +182,9 @@ def _build_result(
     ----------
     portal_requested : bool
         True  — portal_data key was present in the ResultItem (may be None or dict).
-        False — portal was never fetched for this card; skip all advanced logic.
+        False — portal was never fetched for this result; skip advanced logic.
     query : str
-        The search string that was submitted to AniPlaylist for this scrape.
-        Used to score synonyms by relevance when multiple synonyms match.
+        The search string submitted to Algolia. Used to score synonyms.
     """
     if basic["unreleased"]:
         return None
@@ -236,25 +205,15 @@ def _build_result(
     advanced_matched_synonym: str | None = None
     advanced_error: str | None = None
 
-    if not matched_query and portal_requested:
-        if portal is None:
-            # Requested but every retry failed
+    if not matched_query and portal_requested and portal:
+        synonyms: list[str] = portal.get("synonyms") or []
+        if synonyms:
             advanced_attempted = True
-            advanced_error = "portal extraction failed"
-        elif portal:
-            # Non-empty dict — synonyms and/or partial error
-            if "error" in portal:
-                advanced_error = portal["error"]
-
-            synonyms: list[str] = portal.get("synonyms") or []
-            if synonyms:
-                advanced_attempted = True
-                advanced_synonyms = synonyms
-                hit = _best_matching_synonym(synonyms, exact_keys, query)
-                if hit is not None:
-                    matched_query = True
-                    advanced_matched_synonym = hit
-        # portal == {} → info button not found, no attempt recorded
+            advanced_synonyms = synonyms
+            hit = _best_matching_synonym(synonyms, exact_keys, query)
+            if hit is not None:
+                matched_query = True
+                advanced_matched_synonym = hit
 
     return SearchResult(
         anime_title=anime_title,
@@ -279,62 +238,29 @@ def _build_result(
 
 def parse(
     scrape_result: ScrapeResult,
-    save_html: bool,
     exact_titles: Iterable[str] | None = None,
 ) -> list[SearchResult]:
     """
     Convert a ScrapeResult into a flat list of SearchResult objects.
 
-    Works for both Phase-1-only results (no portal_data key) and full
-    Phase-1+2 results.
-
     Parameters
     ----------
     scrape_result : ScrapeResult
-        Output of ``scraper.scrape()``.
+        Output of ``AlgoliaClient.scrape()``.
     exact_titles : iterable of str, optional
         Candidate anime titles used to determine ``matched_query``.
         Defaults to the original search query when omitted.
-
-    Returns
-    -------
-    list[SearchResult]
-        Drop-in for ``db.save_run()``.
     """
     query = scrape_result["query"]
     candidates = list(exact_titles) if exact_titles is not None else [query]
     exact_keys = exact_key_set(candidates)
 
-    if save_html:
-        # Debug: save raw HTML snapshot from scraper
-        raw_html = scrape_result.get("raw_html_snapshot")
-        if raw_html:
-            try:
-                debug_dir = Path("debug/raw_html")
-                debug_dir.mkdir(parents=True, exist_ok=True)
-
-                safe_query = "".join(
-                    c if c.isalnum() or c in ("-", "_") else "_" for c in query
-                )
-
-                path = debug_dir / (f"{datetime.now():%Y%m%d_%H%M%S}_{safe_query}.html")
-
-                path.write_text(
-                    raw_html,
-                    encoding="utf-8",
-                )
-
-                logger.debug("Saved raw HTML snapshot: %s", path)
-            except Exception:
-                logger.exception("Failed saving raw HTML snapshot")
-
     results: list[SearchResult] = []
     dropped = 0
 
     for item in scrape_result["results"]:
-        # portal_data key absent → portal was never requested for this card
         portal_requested = "portal_data" in item
-        portal = item.get("portal_data")  # None when key absent or explicitly None
+        portal = item.get("portal_data")
 
         record = _build_result(
             basic=item["basic_data"],

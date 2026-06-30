@@ -11,13 +11,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import aiohttp
-from ratelimit import (
-    ANILIST_DEFAULT_BURST,
-    ANILIST_DEFAULT_JITTER_MAX,
-    ANILIST_DEFAULT_JITTER_MIN,
-    ANILIST_DEFAULT_RPS,
-    RateLimiter,
-)
+from ratelimit import ANILIST_DEFAULT_BURST, ANILIST_DEFAULT_JITTER_MAX, ANILIST_DEFAULT_JITTER_MIN, ANILIST_DEFAULT_RPS, RateLimiter
 
 logger = logging.getLogger(__name__)
 
@@ -38,13 +32,7 @@ class RateLimitedSession:
         jitter_max: float = ANILIST_DEFAULT_JITTER_MAX,
     ) -> None:
         self._session = aiohttp.ClientSession()
-        self._limiter = RateLimiter(
-            per_second=per_second,
-            name="AniList",
-            burst=burst,
-            jitter_min=jitter_min,
-            jitter_max=jitter_max,
-        )
+        self._limiter = RateLimiter(per_second=per_second, name="AniList", burst=burst, jitter_min=jitter_min, jitter_max=jitter_max)
 
     async def post(self, *args: object, **kwargs: object) -> object:
         await self._limiter.acquire()

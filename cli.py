@@ -50,13 +50,7 @@ def _make_argparser() -> argparse.ArgumentParser:
         "--json", action="store_true", help="Print a JSON summary at the end"
     )
     parser.add_argument(
-        "--headed", action="store_true", help="Run Playwright in headed mode"
-    )
-    parser.add_argument(
         "--confirm", action="store_true", help="Confirm running spotify"
-    )
-    parser.add_argument(
-        "--save-html", action="store_true", help="Save raw html for debugging"
     )
     parser.add_argument(
         "--aniplaylist-delay",
@@ -110,9 +104,7 @@ def main() -> None:
 
     if args.db is None:
         args.db = Path(f"aniplaylist_{args.username}.sqlite3")
-        # Use user_db if it exists, otherwise fall back to DB_PATH
 
-    # Initialize logging with specified level
     safe_timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 
     log_dir = Path("debug/logs")
@@ -127,7 +119,6 @@ def main() -> None:
     logger = logging.getLogger(__name__)
     logger.debug("Parsed CLI args: %s", vars(args))
 
-    # delegate to orchestrator in main.py
     import main as orchestrator
 
     try:
@@ -136,7 +127,7 @@ def main() -> None:
         logger.info("Sync interrupted by user")
         raise
     except Exception as e:
-        logger.error(f"Sync failed: {e}", exc_info=True)
+        logger.error("Sync failed: %s", e, exc_info=True)
         raise
 
 
