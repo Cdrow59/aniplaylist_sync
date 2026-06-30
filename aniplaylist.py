@@ -64,7 +64,13 @@ from dataclasses import dataclass, field
 from typing import TypedDict
 
 import aiohttp
-from ratelimit import ALGOLIA_DEFAULT_BURST, ALGOLIA_DEFAULT_RPS, AlgoliaLimiter
+from ratelimit import (
+    ALGOLIA_DEFAULT_BURST,
+    ALGOLIA_DEFAULT_JITTER_MAX,
+    ALGOLIA_DEFAULT_JITTER_MIN,
+    ALGOLIA_DEFAULT_RPS,
+    AlgoliaLimiter,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -154,12 +160,19 @@ class AlgoliaClient:
     api_key: str
     per_second: float = ALGOLIA_DEFAULT_RPS
     burst: int = ALGOLIA_DEFAULT_BURST
+    jitter_min: float = ALGOLIA_DEFAULT_JITTER_MIN
+    jitter_max: float = ALGOLIA_DEFAULT_JITTER_MAX
 
     _limiter: AlgoliaLimiter = field(init=False, repr=False)
     _session: aiohttp.ClientSession = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
-        self._limiter = AlgoliaLimiter(per_second=self.per_second, burst=self.burst)
+        self._limiter = AlgoliaLimiter(
+            per_second=self.per_second,
+            burst=self.burst,
+            jitter_min=self.jitter_min,
+            jitter_max=self.jitter_max,
+        )
         self._session = aiohttp.ClientSession()
         logger.debug(
             "AlgoliaClient initialised — app_id=%r  rate=%.1f/s  burst=%d",

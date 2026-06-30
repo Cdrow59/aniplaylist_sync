@@ -11,7 +11,13 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import aiohttp
-from ratelimit import MAL_DEFAULT_BURST, MAL_DEFAULT_RPS, RateLimiter
+from ratelimit import (
+    MAL_DEFAULT_BURST,
+    MAL_DEFAULT_JITTER_MAX,
+    MAL_DEFAULT_JITTER_MIN,
+    MAL_DEFAULT_RPS,
+    RateLimiter,
+)
 from rich.progress import Progress
 
 logger = logging.getLogger(__name__)
@@ -23,10 +29,20 @@ class RateLimitedSession:
     """aiohttp session wrapped with a :class:`~ratelimit.RateLimiter`."""
 
     def __init__(
-        self, per_second: float = MAL_DEFAULT_RPS, burst: int = MAL_DEFAULT_BURST
+        self,
+        per_second: float = MAL_DEFAULT_RPS,
+        burst: int = MAL_DEFAULT_BURST,
+        jitter_min: float = MAL_DEFAULT_JITTER_MIN,
+        jitter_max: float = MAL_DEFAULT_JITTER_MAX,
     ) -> None:
         self._session = aiohttp.ClientSession()
-        self._limiter = RateLimiter(per_second=per_second, name="MAL", burst=burst)
+        self._limiter = RateLimiter(
+            per_second=per_second,
+            name="MAL",
+            burst=burst,
+            jitter_min=jitter_min,
+            jitter_max=jitter_max,
+        )
 
     async def get(self, *args: object, **kwargs: object) -> object:
         await self._limiter.acquire()

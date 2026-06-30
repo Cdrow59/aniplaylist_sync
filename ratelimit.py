@@ -91,6 +91,8 @@ class RateLimiter:
         *,
         name: str = "unnamed",
         burst: int = 1,
+        jitter_min: float = 0.0,
+        jitter_max: float = 0.0,
     ) -> None:
         if per_second <= 0:
             raise ValueError(f"per_second must be > 0, got {per_second!r}")
@@ -100,17 +102,21 @@ class RateLimiter:
         self.per_second = per_second
         self.name = name
         self.burst = burst
+        self.jitter_min = jitter_min
+        self.jitter_max = jitter_max
         self._min_interval = 1.0 / per_second
         self._lock = asyncio.Lock()
         self._last_release: float = 0.0
         self._burst_remaining: int = burst
 
         logger.info(
-            "RateLimiter[%s] created — %.3f req/s  interval=%.3fs  burst=%d",
+            "RateLimiter[%s] created — %.3f req/s  interval=%.3fs  burst=%d  jitter=[%.3f, %.3f]",
             name,
             per_second,
             self._min_interval,
             burst,
+            jitter_min,
+            jitter_max,
         )
 
     async def acquire(self) -> None:
@@ -128,6 +134,8 @@ class RateLimiter:
 
             now = asyncio.get_running_loop().time()
             wait = self._min_interval - (now - self._last_release)
+            if self.jitter_max > 0:
+                wait += random.uniform(self.jitter_min, self.jitter_max)
             if wait > 0:
                 logger.debug("RateLimiter[%s] sleeping %.3fs", self.name, wait)
                 await asyncio.sleep(wait)
@@ -171,6 +179,8 @@ class SyncRateLimiter:
         *,
         name: str = "unnamed-sync",
         burst: int = 1,
+        jitter_min: float = 0.0,
+        jitter_max: float = 0.0,
     ) -> None:
         if per_second <= 0:
             raise ValueError(f"per_second must be > 0, got {per_second!r}")
@@ -178,17 +188,21 @@ class SyncRateLimiter:
         self.per_second = per_second
         self.name = name
         self.burst = burst
+        self.jitter_min = jitter_min
+        self.jitter_max = jitter_max
         self._min_interval = 1.0 / per_second
         self._lock = threading.Lock()
         self._last_release: float = 0.0
         self._burst_remaining: int = burst
 
         logger.info(
-            "SyncRateLimiter[%s] created — %.3f req/s  interval=%.3fs  burst=%d",
+            "SyncRateLimiter[%s] created — %.3f req/s  interval=%.3fs  burst=%d  jitter=[%.3f, %.3f]",
             name,
             per_second,
             self._min_interval,
             burst,
+            jitter_min,
+            jitter_max,
         )
 
     def acquire(self) -> None:
@@ -201,6 +215,8 @@ class SyncRateLimiter:
 
             now = time.monotonic()
             wait = self._min_interval - (now - self._last_release)
+            if self.jitter_max > 0:
+                wait += random.uniform(self.jitter_min, self.jitter_max)
             if wait > 0:
                 logger.debug("SyncRateLimiter[%s] sleeping %.3fs", self.name, wait)
                 time.sleep(wait)
@@ -234,10 +250,18 @@ class AlgoliaLimiter:
         *,
         name: str = "Algolia",
         burst: int = ALGOLIA_DEFAULT_BURST,
+        jitter_min: float = ALGOLIA_DEFAULT_JITTER_MIN,
+        jitter_max: float = ALGOLIA_DEFAULT_JITTER_MAX,
     ) -> None:
         if per_second <= 0:
             raise ValueError(f"per_second must be > 0, got {per_second!r}")
-        self._inner = RateLimiter(per_second=per_second, name=name, burst=burst)
+        self._inner = RateLimiter(
+            per_second=per_second,
+            name=name,
+            burst=burst,
+            jitter_min=jitter_min,
+            jitter_max=jitter_max,
+        )
         logger.debug(
             "AlgoliaLimiter[%s] created — %.1f req/s  interval=%.3fs  burst=%d",
             name,
