@@ -12,16 +12,10 @@ logger = logging.getLogger(__name__)
 # Global Default Configuration Budgets
 # ---------------------------------------------------------------------------
 DEFAULTS = {
-    "MAL": {"per_second": 1.0, "burst": 1, "jitter_min": 0.0, "jitter_max": 0.0},
-    "AniList": {"per_second": 1.0, "burst": 1, "jitter_min": 0.0, "jitter_max": 0.0},
-    "Spotify": {"per_second": 2.0, "burst": 1, "jitter_min": 0.0, "jitter_max": 0.0},
-    "Algolia": {"per_second": 0.25, "burst": 1, "jitter_min": 0.1, "jitter_max": 1.0},
-    "AniPlaylist": {
-        "per_second": 0.5,
-        "burst": 1,
-        "jitter_min": 0.0,
-        "jitter_max": 0.0,
-    },
+    "MAL": {"per_second": 1.0, "burst": 0, "jitter_min": 0.0, "jitter_max": 0.0},
+    "AniList": {"per_second": 1.0, "burst": 0, "jitter_min": 0.0, "jitter_max": 0.0},
+    "Spotify": {"per_second": 2.0, "burst": 0, "jitter_min": 0.0, "jitter_max": 0.0},
+    "Algolia": {"per_second": 0.25, "burst": 0, "jitter_min": 0.1, "jitter_max": 1.0},
 }
 
 
@@ -40,14 +34,14 @@ class RateLimiter:
         per_second: float = 1.0,
         *,
         name: str = "unnamed",
-        burst: int = 1,
+        burst: int = 0,
         jitter_min: float = 0.0,
         jitter_max: float = 0.0,
     ) -> None:
         if per_second <= 0:
             raise ValueError(f"per_second must be > 0, got {per_second!r}")
-        if burst < 1:
-            raise ValueError(f"burst must be >= 1, got {burst!r}")
+        if burst < 0:
+            raise ValueError(f"burst must be >= 0, got {burst!r}")
 
         self.per_second = per_second
         self.name = name
@@ -57,7 +51,7 @@ class RateLimiter:
         self._min_interval = 1.0 / per_second
 
         self._lock = threading.Lock()
-        self._last_release: float = 0.0
+        self._last_release: float = time.monotonic() if burst == 0 else 0.0
         self._burst_remaining: int = burst
 
         logger.info(

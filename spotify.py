@@ -13,37 +13,14 @@ import urllib.parse
 from pathlib import Path
 from typing import Any, Iterable
 
-import aiosqlite
 import aiohttp
+import aiosqlite
 from ratelimit import RateLimiter
 from rich.progress import Progress
 
 logger = logging.getLogger(__name__)
 
 SPOTIFY_PLAYLIST_LIMIT = 9999
-# ---------------------------------------------------------------------------
-# ENV
-# ---------------------------------------------------------------------------
-
-
-def _read_spotify_env(name: str) -> str:
-    value = os.getenv(name)
-    if value and value.strip():
-        return value.strip()
-
-    if name.startswith("SPOTIPY_"):
-        fallback = name.replace("SPOTIPY_", "SPOTIFY_", 1)
-        val = os.getenv(fallback)
-        if val and val.strip():
-            return val.strip()
-
-    if name.startswith("SPOTIFY_"):
-        fallback = name.replace("SPOTIFY_", "SPOTIPY_", 1)
-        val = os.getenv(fallback)
-        if val and val.strip():
-            return val.strip()
-
-    raise RuntimeError(f"Missing required environment variable: {name}")
 
 
 # ---------------------------------------------------------------------------
@@ -107,13 +84,12 @@ class SpotifyClient:
         """Create a SpotifyClient from environment variables.
 
         Reads ``SPOTIFY_CLIENT_ID``, ``SPOTIFY_CLIENT_SECRET``, and
-        ``SPOTIFY_REFRESH_TOKEN`` (with ``SPOTIPY_`` prefix fallbacks for the
-        first two).  Run :func:`run_auth_flow` once to obtain the refresh token.
+        ``SPOTIFY_REFRESH_TOKEN``.  Run :func:`run_auth_flow` once to obtain the refresh token.
         """
         return cls(
-            client_id=_read_spotify_env("SPOTIPY_CLIENT_ID"),
-            client_secret=_read_spotify_env("SPOTIPY_CLIENT_SECRET"),
-            refresh_token=_read_spotify_env("SPOTIFY_REFRESH_TOKEN"),
+            client_id=os.getenv("SPOTIFY_CLIENT_ID"),
+            client_secret=os.getenv("SPOTIFY_CLIENT_SECRET"),
+            refresh_token=os.getenv("SPOTIFY_REFRESH_TOKEN"),
         )
 
     # ------------------------------------------------------------------
@@ -221,7 +197,9 @@ class SpotifyClient:
                     # Token expired mid-flight; force refresh and retry
                     logger.warning(
                         "Spotify 401 on %s %s — forcing token refresh (attempt %d/5)",
-                        method, path, attempt + 1,
+                        method,
+                        path,
+                        attempt + 1,
                     )
                     async with self._token_lock:
                         self._access_token = None
@@ -232,16 +210,23 @@ class SpotifyClient:
                     retry_after = float(resp.headers.get("Retry-After", 1))
                     logger.warning(
                         "Spotify 429 on %s %s — retrying in %.1fs (attempt %d/5)",
-                        method, path, retry_after, attempt + 1,
+                        method,
+                        path,
+                        retry_after,
+                        attempt + 1,
                     )
                     await asyncio.sleep(retry_after)
                     continue
 
                 if resp.status in {500, 502, 503, 504}:
-                    delay = 2.0 * (2 ** attempt)
+                    delay = 2.0 * (2**attempt)
                     logger.warning(
                         "Spotify HTTP %d on %s %s — retrying in %.1fs (attempt %d/5)",
-                        resp.status, method, path, delay, attempt + 1,
+                        resp.status,
+                        method,
+                        path,
+                        delay,
+                        attempt + 1,
                     )
                     await asyncio.sleep(delay)
                     continue
@@ -296,16 +281,18 @@ def run_auth_flow(
     """
     import urllib.request
 
-    client_id = client_id or _read_spotify_env("SPOTIPY_CLIENT_ID")
-    client_secret = client_secret or _read_spotify_env("SPOTIPY_CLIENT_SECRET")
-    redirect_uri = redirect_uri or _read_spotify_env("SPOTIPY_REDIRECT_URI")
+    client_id = client_id or os.getenv("SPOTIFY_CLIENT_ID")
+    client_secret = client_secret or os.getenv("SPOTIFY_CLIENT_SECRET")
+    redirect_uri = redirect_uri or os.getenv("SPOTIFY_REDIRECT_URI")
 
-    params = urllib.parse.urlencode({
-        "client_id": client_id,
-        "response_type": "code",
-        "redirect_uri": redirect_uri,
-        "scope": _SPOTIFY_SCOPE,
-    })
+    params = urllib.parse.urlencode(
+        {
+            "client_id": client_id,
+            "response_type": "code",
+            "redirect_uri": redirect_uri,
+            "scope": _SPOTIFY_SCOPE,
+        }
+    )
     auth_url = f"{_SPOTIFY_AUTH_URL}?{params}"
 
     print("\n── Spotify Auth Flow ──────────────────────────────────────")
@@ -324,11 +311,13 @@ def run_auth_flow(
     credentials = base64.b64encode(f"{client_id}:{client_secret}".encode()).decode()
     req = urllib.request.Request(
         _SPOTIFY_TOKEN_URL,
-        data=urllib.parse.urlencode({
-            "grant_type": "authorization_code",
-            "code": code,
-            "redirect_uri": redirect_uri,
-        }).encode(),
+        data=urllib.parse.urlencode(
+            {
+                "grant_type": "authorization_code",
+                "code": code,
+                "redirect_uri": redirect_uri,
+            }
+        ).encode(),
         headers={
             "Authorization": f"Basic {credentials}",
             "Content-Type": "application/x-www-form-urlencoded",
