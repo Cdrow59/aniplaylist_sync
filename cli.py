@@ -47,7 +47,10 @@ def _make_argparser() -> argparse.ArgumentParser:
         help="Keep all AniPlaylist results instead of only exact anime-title matches",
     )
     parser.add_argument(
-        "--json", action="store_true", help="Print a JSON summary at the end"
+        "--json", action="store_true", help="Write per-entry parsed results to debug/json/"
+    )
+    parser.add_argument(
+        "--raw", action="store_true", help="Write raw Algolia HTTP responses to debug/raw/"
     )
     parser.add_argument(
         "--confirm", action="store_true", help="Confirm running spotify"

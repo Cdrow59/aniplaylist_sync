@@ -251,7 +251,13 @@ class AlgoliaClient:
         )
         return {"requests": [{"indexName": _INDEX, "params": params}]}
 
-    async def _fetch_page(self, query: str, page: int, mal_label: str) -> dict:
+    async def _fetch_page(
+        self,
+        query: str,
+        page: int,
+        mal_label: str,
+        raw_log: list[dict] | None = None,
+    ) -> dict:
         """Fetch one Algolia page with retry/backoff on transient errors.
 
         HTTP responses handled by status range:
@@ -259,7 +265,12 @@ class AlgoliaClient:
           429 — rate limited: retry indefinitely with backoff (Retry-After respected)
           5xx — server error: retry up to _RETRY_ATTEMPTS times with backoff
           4xx (other) — client error: raise immediately
+
+        If *raw_log* is provided, a dict is appended for every attempt with the
+        full response envelope (status, headers, body, timing).
         """
+        import time as _time
+
         payload = self._build_payload(query, page)
 
         attempt = 0
@@ -273,15 +284,44 @@ class AlgoliaClient:
                 attempt,
             )
 
+            t0 = _time.monotonic()
             async with self._session.post(
                 self._url(), headers=self._headers(), json=payload
             ) as resp:
                 status = resp.status
+                elapsed_ms = round((_time.monotonic() - t0) * 1000, 1)
+                resp_headers = dict(resp.headers)
 
                 if 200 <= status < 300:
-                    return (await resp.json())["results"][0]
+                    body = await resp.json()
+                    if raw_log is not None:
+                        raw_log.append({
+                            "page": page,
+                            "attempt": attempt,
+                            "status": status,
+                            "elapsed_ms": elapsed_ms,
+                            "headers": resp_headers,
+                            "body": body,
+                            "error": None,
+                        })
+                    return body["results"][0]
 
                 text = await resp.text()
+                try:
+                    body_raw = json.loads(text)
+                except Exception:
+                    body_raw = text
+
+                if raw_log is not None:
+                    raw_log.append({
+                        "page": page,
+                        "attempt": attempt,
+                        "status": status,
+                        "elapsed_ms": elapsed_ms,
+                        "headers": resp_headers,
+                        "body": body_raw,
+                        "error": f"HTTP {status}",
+                    })
 
                 if status == 429:
                     # Rate limited — retry indefinitely, honouring Retry-After
@@ -421,12 +461,9 @@ class AlgoliaClient:
         headless: bool = True,  # accepted for API compat; ignored
         fetch_portal_indices: set[int] | None = None,  # accepted; ignored
         mal_label: str = "",
+        raw_log: list[dict] | None = None,
     ) -> ScrapeResult:
         """Search AniPlaylist via Algolia for *query*.
-
-        Parameters mirror the former Playwright-based scrape() so callers in
-        main.py need no changes.  ``headless`` and ``fetch_portal_indices`` are
-        accepted but have no effect — the API returns all data directly.
 
         Args:
             query:                Search term (anime title, song name, …).
@@ -434,13 +471,16 @@ class AlgoliaClient:
             fetch_portal_indices: When not None, alternate anime titles are
                                   injected as portal synonyms (Pass 2 behaviour).
             mal_label:            Optional "[MAL:id 'title']" prefix for log lines.
+            raw_log:              If provided, each HTTP attempt's full response
+                                  envelope (status, headers, body, timing) is
+                                  appended to this list.
         """
         logger.info("%s AlgoliaClient.scrape() — query=%r", mal_label, query)
 
         all_hits: list[dict] = []
 
         # Fetch page 0 first to learn total page count
-        result0 = await self._fetch_page(query, 0, mal_label)
+        result0 = await self._fetch_page(query, 0, mal_label, raw_log)
         nb_pages: int = result0.get("nbPages", 1)
         nb_hits: int = result0.get("nbHits", 0)
         all_hits.extend(result0.get("hits", []))
@@ -454,7 +494,7 @@ class AlgoliaClient:
 
         # Fetch remaining pages concurrently (still rate-limited per request)
         if nb_pages > 1:
-            tasks = [self._fetch_page(query, p, mal_label) for p in range(1, nb_pages)]
+            tasks = [self._fetch_page(query, p, mal_label, raw_log) for p in range(1, nb_pages)]
             pages = await asyncio.gather(*tasks, return_exceptions=True)
             for i, page_result in enumerate(pages, start=1):
                 if isinstance(page_result, Exception):

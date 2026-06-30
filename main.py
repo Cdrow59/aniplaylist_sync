@@ -158,6 +158,7 @@ async def _search_one(
     mal_id: int,
     mal_title: str,
     allow_pass2: bool = True,
+    raw_log: list[dict] | None = None,
 ) -> tuple[list[SearchResult], list[dict], bool]:
     ctx = f"[MAL:{mal_id} '{mal_title}']"
     attempt_logs: list[dict] = []
@@ -165,7 +166,7 @@ async def _search_one(
     # ── Pass 1: fetch all hits, match on primary anime title ─────────────
     logger.info("%s Searching — query=%r", ctx, title_query)
     try:
-        scrape_result = await algolia.scrape(title_query, mal_label=ctx)
+        scrape_result = await algolia.scrape(title_query, mal_label=ctx, raw_log=raw_log)
     except (RuntimeError, ValueError, OSError) as exc:
         logger.warning("%s Search failed for query=%r: %s", ctx, title_query, exc)
         attempt_logs.append(
@@ -240,6 +241,7 @@ async def _search_one(
             title_query,
             fetch_portal_indices=unmatched_indices,
             mal_label=ctx,
+            raw_log=raw_log,
         )
     except (RuntimeError, ValueError, OSError) as exc:
         logger.error("%s Synonym fetch failed for query=%r: %s", ctx, title_query, exc)
@@ -302,6 +304,30 @@ async def _search_one(
     return results, attempt_logs, True
 
 
+def _write_raw_log(
+    raw_dir: Path,
+    mal_id: int,
+    title: str,
+    raw_log: list[dict],
+) -> None:
+    """Write the full HTTP response log for one MAL entry to debug/raw/."""
+    safe = "".join(c if c.isalnum() or c in "-_" else "_" for c in title)[:60]
+    path = raw_dir / f"{mal_id}_{safe}.json"
+    payload = {
+        "mal_id": mal_id,
+        "mal_title": title,
+        "requests": raw_log,
+    }
+    try:
+        path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        logger.debug("Wrote raw HTTP log — %s", path)
+    except (OSError, TypeError) as exc:
+        logger.warning("Failed to write raw log for MAL:%d: %s", mal_id, exc)
+
+
 def _result_to_dict(r: SearchResult) -> dict:
     return {
         "anime_title": r.anime_title,
@@ -350,12 +376,18 @@ async def run_aniplaylist_stage(
     algolia: AlgoliaClient,
     exact_filter: bool,
     emit_json: bool,
+    emit_raw: bool,
     progress: Progress,
 ) -> list[dict[str, object]]:
     json_dir: Path | None = None
     if emit_json:
         json_dir = Path("debug/json")
         json_dir.mkdir(parents=True, exist_ok=True)
+
+    raw_dir: Path | None = None
+    if emit_raw:
+        raw_dir = Path("debug/raw")
+        raw_dir.mkdir(parents=True, exist_ok=True)
 
     summary: list[dict[str, object]] = []
     task_id = progress.add_task("AniPlaylist", total=len(mal_entries))
@@ -374,6 +406,7 @@ async def run_aniplaylist_stage(
         all_attempt_logs: list[dict] = []
         any_scrape_succeeded = False
         total_hits_seen = 0
+        entry_raw_log: list[dict] = [] if emit_raw else None  # type: ignore[assignment]
 
         for title_query in titles_to_try:
             results, attempt_logs, succeeded = await _search_one(
@@ -384,6 +417,7 @@ async def run_aniplaylist_stage(
                 mal_id=entry.mal_id,
                 mal_title=entry.title,
                 allow_pass2=False,
+                raw_log=entry_raw_log,
             )
             all_attempt_logs.extend(attempt_logs)
             total_hits_seen += sum(log.get("result_count", 0) for log in attempt_logs)
@@ -418,6 +452,7 @@ async def run_aniplaylist_stage(
                     mal_id=entry.mal_id,
                     mal_title=entry.title,
                     allow_pass2=True,
+                    raw_log=entry_raw_log,
                 )
                 all_attempt_logs.extend(attempt_logs)
                 total_hits_seen += sum(
@@ -498,6 +533,9 @@ async def run_aniplaylist_stage(
                 results=results,
                 attempt_logs=all_attempt_logs,
             )
+
+        if emit_raw and raw_dir is not None and entry_raw_log:
+            _write_raw_log(raw_dir, entry.mal_id, entry.title, entry_raw_log)
 
         summary.append(
             {
@@ -634,6 +672,7 @@ async def run_main_pipeline(args) -> list[dict[str, object]]:
                     algolia=algolia,
                     exact_filter=not args.no_exact_filter,
                     emit_json=args.json,
+                    emit_raw=args.raw,
                     progress=progress,
                 )
             )
