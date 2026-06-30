@@ -44,7 +44,7 @@ logger = logging.getLogger(__name__)
 MAL_DEFAULT_RPS: float = 1.0  # MAL docs: ~3 req/s; 1.0 is conservative
 ANILIST_DEFAULT_RPS: float = 1.0  # AniList: ~90 req/min; 1.0 ≈ 60 req/min
 SPOTIFY_DEFAULT_RPS: float = 2.0  # spotipy handles 429s; 5.0 stays well under
-ALGOLIA_DEFAULT_RPS: float = 0.5  # 5 req/s — well under Algolia's ceiling
+ALGOLIA_DEFAULT_RPS: float = 0.25  # 5 req/s — well under Algolia's ceiling
 
 # Default burst budgets — number of requests allowed with no delay at startup
 MAL_DEFAULT_BURST: int = 1
@@ -56,13 +56,13 @@ ALGOLIA_DEFAULT_BURST: int = 1  # allow a small burst on first search
 MAL_DEFAULT_JITTER_MIN: int = 0
 ANILIST_DEFAULT_JITTER_MIN: int = 0
 SPOTIFY_DEFAULT_JITTER_MIN: int = 0
-ALGOLIA_DEFAULT_JITTER_MIN: int = 0
+ALGOLIA_DEFAULT_JITTER_MIN: int = 0.1
 
 # Random Jitter Max
 MAL_DEFAULT_JITTER_MAX: int = 0
 ANILIST_DEFAULT_JITTER_MAX: int = 0
 SPOTIFY_DEFAULT_JITTER_MAX: int = 0
-ALGOLIA_DEFAULT_JITTER_MAX: int = 0
+ALGOLIA_DEFAULT_JITTER_MAX: int = 1
 # ---------------------------------------------------------------------------
 # Async rate limiter (MAL, AniList)
 # ---------------------------------------------------------------------------

@@ -64,7 +64,13 @@ from dataclasses import dataclass, field
 from typing import TypedDict
 
 import aiohttp
-from ratelimit import ALGOLIA_DEFAULT_BURST, ALGOLIA_DEFAULT_JITTER_MAX, ALGOLIA_DEFAULT_JITTER_MIN, ALGOLIA_DEFAULT_RPS, AlgoliaLimiter
+from ratelimit import (
+    ALGOLIA_DEFAULT_BURST,
+    ALGOLIA_DEFAULT_JITTER_MAX,
+    ALGOLIA_DEFAULT_JITTER_MIN,
+    ALGOLIA_DEFAULT_RPS,
+    AlgoliaLimiter,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -74,7 +80,7 @@ logger = logging.getLogger(__name__)
 
 _RETRY_ATTEMPTS = 4  # max attempts for 5xx server errors
 _RETRY_BASE_DELAY = 8  # seconds — doubled on each retry
-_RETRY_MAX_DELAY = 60.0  # cap so we never wait longer than this
+_RETRY_MAX_DELAY = 60 * 60 * 1  # cap so we never wait longer than this
 
 # ---------------------------------------------------------------------------
 # Algolia constants
@@ -161,7 +167,12 @@ class AlgoliaClient:
     _session: aiohttp.ClientSession = field(init=False, repr=False)
 
     def __post_init__(self) -> None:
-        self._limiter = AlgoliaLimiter(per_second=self.per_second, burst=self.burst, jitter_min=self.jitter_min, jitter_max=self.jitter_max)
+        self._limiter = AlgoliaLimiter(
+            per_second=self.per_second,
+            burst=self.burst,
+            jitter_min=self.jitter_min,
+            jitter_max=self.jitter_max,
+        )
         self._session = aiohttp.ClientSession()
         logger.debug(
             "AlgoliaClient initialised — app_id=%r  rate=%.1f/s  burst=%d",
@@ -295,15 +306,17 @@ class AlgoliaClient:
                 if 200 <= status < 300:
                     body = await resp.json()
                     if raw_log is not None:
-                        raw_log.append({
-                            "page": page,
-                            "attempt": attempt,
-                            "status": status,
-                            "elapsed_ms": elapsed_ms,
-                            "headers": resp_headers,
-                            "body": body,
-                            "error": None,
-                        })
+                        raw_log.append(
+                            {
+                                "page": page,
+                                "attempt": attempt,
+                                "status": status,
+                                "elapsed_ms": elapsed_ms,
+                                "headers": resp_headers,
+                                "body": body,
+                                "error": None,
+                            }
+                        )
                     return body["results"][0]
 
                 text = await resp.text()
@@ -313,15 +326,17 @@ class AlgoliaClient:
                     body_raw = text
 
                 if raw_log is not None:
-                    raw_log.append({
-                        "page": page,
-                        "attempt": attempt,
-                        "status": status,
-                        "elapsed_ms": elapsed_ms,
-                        "headers": resp_headers,
-                        "body": body_raw,
-                        "error": f"HTTP {status}",
-                    })
+                    raw_log.append(
+                        {
+                            "page": page,
+                            "attempt": attempt,
+                            "status": status,
+                            "elapsed_ms": elapsed_ms,
+                            "headers": resp_headers,
+                            "body": body_raw,
+                            "error": f"HTTP {status}",
+                        }
+                    )
 
                 if status == 429:
                     # Rate limited — retry indefinitely, honouring Retry-After
@@ -494,7 +509,10 @@ class AlgoliaClient:
 
         # Fetch remaining pages concurrently (still rate-limited per request)
         if nb_pages > 1:
-            tasks = [self._fetch_page(query, p, mal_label, raw_log) for p in range(1, nb_pages)]
+            tasks = [
+                self._fetch_page(query, p, mal_label, raw_log)
+                for p in range(1, nb_pages)
+            ]
             pages = await asyncio.gather(*tasks, return_exceptions=True)
             for i, page_result in enumerate(pages, start=1):
                 if isinstance(page_result, Exception):
