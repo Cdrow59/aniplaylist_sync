@@ -25,7 +25,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Iterable
 
-from scraper import BasicData, ResultItem, ScrapeResult
+from aniplaylist import BasicData, ResultItem, ScrapeResult
 
 logger = logging.getLogger(__name__)
 

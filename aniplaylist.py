@@ -72,8 +72,8 @@ logger = logging.getLogger(__name__)
 # Retry constants
 # ---------------------------------------------------------------------------
 
-_RETRY_ATTEMPTS = 4  # total attempts (1 initial + 3 retries)
-_RETRY_BASE_DELAY = 1.0  # seconds — doubled on each retry
+_RETRY_ATTEMPTS = 4  # max attempts for 5xx server errors
+_RETRY_BASE_DELAY = 8  # seconds — doubled on each retry
 _RETRY_MAX_DELAY = 60.0  # cap so we never wait longer than this
 
 # ---------------------------------------------------------------------------
@@ -254,13 +254,14 @@ class AlgoliaClient:
 
         HTTP responses handled by status range:
           2xx — success
-          429 — rate limited: back off (Retry-After header respected) and retry
-          5xx — server error: retry with backoff
+          429 — rate limited: retry indefinitely with backoff (Retry-After respected)
+          5xx — server error: retry up to _RETRY_ATTEMPTS times with backoff
           4xx (other) — client error: raise immediately
         """
         payload = self._build_payload(query, page)
 
-        for attempt in range(_RETRY_ATTEMPTS):
+        attempt = 0
+        while True:
             await self._limiter.acquire()
             logger.debug(
                 "%s Algolia page=%d query=%r attempt=%d",
@@ -278,10 +279,10 @@ class AlgoliaClient:
                 if 200 <= status < 300:
                     return (await resp.json())["results"][0]
 
-                retryable = status == 429 or status >= 500
                 text = await resp.text()
 
-                if retryable and attempt < _RETRY_ATTEMPTS - 1:
+                if status == 429:
+                    # Rate limited — retry indefinitely, honouring Retry-After
                     retry_after = resp.headers.get("Retry-After")
                     if retry_after is not None:
                         try:
@@ -292,22 +293,36 @@ class AlgoliaClient:
                             )
                     else:
                         delay = min(_RETRY_BASE_DELAY * (2**attempt), _RETRY_MAX_DELAY)
-
                     logger.warning(
-                        "%s Algolia HTTP %d on page=%d — retrying in %.1fs "
-                        "(attempt %d/%d): %s",
+                        "%s Algolia 429 on page=%d — retrying in %.1fs (attempt %d): %s",
                         mal_label,
-                        status,
                         page,
                         delay,
                         attempt + 1,
-                        _RETRY_ATTEMPTS,
                         text[:200],
                     )
                     await asyncio.sleep(delay)
+                    attempt += 1
                     continue
 
-                if retryable:
+                if status >= 500:
+                    # Transient server error — retry up to _RETRY_ATTEMPTS times
+                    if attempt < _RETRY_ATTEMPTS - 1:
+                        delay = min(_RETRY_BASE_DELAY * (2**attempt), _RETRY_MAX_DELAY)
+                        logger.warning(
+                            "%s Algolia HTTP %d on page=%d — retrying in %.1fs "
+                            "(attempt %d/%d): %s",
+                            mal_label,
+                            status,
+                            page,
+                            delay,
+                            attempt + 1,
+                            _RETRY_ATTEMPTS,
+                            text[:200],
+                        )
+                        await asyncio.sleep(delay)
+                        attempt += 1
+                        continue
                     logger.error(
                         "%s Algolia HTTP %d on page=%d — all %d attempts exhausted: %s",
                         mal_label,
@@ -317,6 +332,7 @@ class AlgoliaClient:
                         text[:200],
                     )
                 else:
+                    # 4xx (non-429) — non-retryable
                     logger.error(
                         "%s Algolia HTTP %d on page=%d (non-retryable): %s",
                         mal_label,
@@ -327,8 +343,6 @@ class AlgoliaClient:
                 raise RuntimeError(
                     f"Algolia HTTP {status} on page {page}: {text[:200]}"
                 )
-
-        raise RuntimeError(f"_fetch_page loop exited without returning (page={page})")
 
     @staticmethod
     def _hit_to_result_item(

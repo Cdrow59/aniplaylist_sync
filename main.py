@@ -10,7 +10,6 @@ from parser import SearchResult, parse
 from pathlib import Path
 
 import rich
-from playwright.async_api import Error as PlaywrightError
 from rich.progress import (
     BarColumn,
     MofNCompleteColumn,
@@ -22,7 +21,7 @@ from rich.progress import (
 from rich.prompt import Confirm, Prompt
 
 from anilist import AniListClient
-from aniplaylist import AlgoliaClient
+from aniplaylist import AlgoliaClient, ScrapeResult
 from db import (
     DB_PATH,
     FAILURE_NO_MATCH,
@@ -171,7 +170,7 @@ async def _search_one(
         scrape_result = await algolia.scrape(
             title_query, headless=not headed, mal_label=ctx
         )
-    except (PlaywrightError, RuntimeError, ValueError, OSError) as exc:
+    except (RuntimeError, ValueError, OSError) as exc:
         logger.warning("%s Pass 1 failed for query '%s': %s", ctx, title_query, exc)
         attempt_logs.append(
             {
@@ -248,7 +247,7 @@ async def _search_one(
             fetch_portal_indices=unmatched_indices,
             mal_label=ctx,
         )
-    except (PlaywrightError, RuntimeError, ValueError, OSError) as exc:
+    except (RuntimeError, ValueError, OSError) as exc:
         logger.error(
             "%s Pass 2 scrape failed for query '%s': %s", ctx, title_query, exc
         )
@@ -350,7 +349,6 @@ async def run_aniplaylist_stage(
     algolia: AlgoliaClient,
     headed: bool,
     exact_filter: bool,
-    aniplaylist_delay: float,
     emit_json: bool,
     save_html: bool,
     progress: Progress,
@@ -500,9 +498,6 @@ async def run_aniplaylist_stage(
             }
         )
 
-        if aniplaylist_delay > 0:
-            await asyncio.sleep(aniplaylist_delay)
-
         progress.advance(task_id)
 
     return summary
@@ -624,17 +619,6 @@ async def run_main_pipeline(args) -> list[dict[str, object]]:
                 source_label,
             )
 
-            delay = (
-                args.aniplaylist_delay
-                if args.aniplaylist_delay is not None
-                else float(
-                    read_env(
-                        "ANIPLAYLIST_DELAY_SECONDS",
-                        "60",
-                    )
-                )
-            )
-
             series_task = asyncio.create_task(
                 run_series_stage(
                     args.db,
@@ -651,7 +635,6 @@ async def run_main_pipeline(args) -> list[dict[str, object]]:
                     algolia=algolia,
                     headed=args.headed,
                     exact_filter=not args.no_exact_filter,
-                    aniplaylist_delay=delay,
                     emit_json=args.json,
                     save_html=args.save_html,
                     progress=progress,
