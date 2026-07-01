@@ -232,3 +232,4 @@ debug
 
 #outputfiles
 *.csv
+output/

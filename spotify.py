@@ -868,17 +868,41 @@ async def create_spotify_playlist(
     return created
 
 
-def _write_playlist_csv(username: str, records: list[dict[str, object]]) -> Path:
-    """Write playlist id/name/length rows to ``{username}_output.csv``."""
-    path = Path(f"{username}_output.csv")
-    with path.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(["playlist_id", "name", "length"])
-        for r in records:
-            writer.writerow([r["id"], r["name"], r["length"]])
+_PLAYLIST_CSV_HEADER = ["playlist_id", "name", "length"]
 
-    logger.info("Wrote %d playlist record(s) to %s", len(records), path)
-    return path
+
+class _PlaylistCsvWriter:
+    """Writes playlist id/name/length rows incrementally to
+    ``output/output_{username}.csv`` as each playlist is created, so
+    progress isn't lost if a run is interrupted partway through.
+    """
+
+    def __init__(self, username: str) -> None:
+        self.path = Path("output") / f"output_{username}.csv"
+        self._file = None
+        self._writer = None
+        self.count = 0
+
+    def __enter__(self) -> "_PlaylistCsvWriter":
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._file = self.path.open("w", newline="", encoding="utf-8")
+        self._writer = csv.writer(self._file)
+        self._writer.writerow(_PLAYLIST_CSV_HEADER)
+        self._file.flush()
+        return self
+
+    def write_records(self, records: list[dict[str, object]]) -> None:
+        if not records or self._writer is None:
+            return
+        for r in records:
+            self._writer.writerow([r["id"], r["name"], r["length"]])
+        self._file.flush()
+        self.count += len(records)
+
+    def __exit__(self, *_: object) -> None:
+        if self._file is not None:
+            self._file.close()
+        logger.info("Wrote %d playlist record(s) to %s", self.count, self.path)
 
 
 # ---------------------------------------------------------------------------
@@ -897,47 +921,56 @@ async def run_spotify_stage(
     client = await SpotifyClient.from_env_async()
 
     try:
-        user_id = (await client.current_user())["id"]
-    except RuntimeError as exc:
-        # Stored refresh token is invalid/expired/revoked — re-authorise
-        # in the browser automatically rather than failing out.
-        msg = str(exc)
-        if "Spotify token refresh failed" in msg or " 400" in msg or " 401" in msg:
-            logger.warning(
-                "SPOTIFY_REFRESH_TOKEN appears invalid or expired — "
-                "re-authorising in browser"
-            )
-            new_refresh_token = await run_auth_flow_async(
-                client._client_id,
-                client._client_secret,
-                os.getenv("SPOTIFY_REDIRECT_URI"),
-            )
-            client._refresh_token = new_refresh_token
-            client._access_token = None
+        try:
             user_id = (await client.current_user())["id"]
+        except RuntimeError as exc:
+            # Stored refresh token is invalid/expired/revoked — re-authorise
+            # in the browser automatically rather than failing out.
+            msg = str(exc)
+            if "Spotify token refresh failed" in msg or " 400" in msg or " 401" in msg:
+                logger.warning(
+                    "SPOTIFY_REFRESH_TOKEN appears invalid or expired — "
+                    "re-authorising in browser"
+                )
+                new_refresh_token = await run_auth_flow_async(
+                    client._client_id,
+                    client._client_secret,
+                    os.getenv("SPOTIFY_REDIRECT_URI"),
+                )
+                client._refresh_token = new_refresh_token
+                client._access_token = None
+                user_id = (await client.current_user())["id"]
+            else:
+                raise
+
+        if megaplaylist:
+            sources = [("AniPlaylist Megaplaylist", await fetch_result_links(db_path))]
         else:
-            raise
+            sources = []
+            for name, ids in await fetch_series_playlist_sources(db_path):
+                entries = await fetch_playlist_links_for_mal_ids(db_path, ids)
+                sources.append((name, entries))
 
-    if megaplaylist:
-        sources = [("AniPlaylist Megaplaylist", await fetch_result_links(db_path))]
-    else:
-        sources = []
-        for name, ids in await fetch_series_playlist_sources(db_path):
-            entries = await fetch_playlist_links_for_mal_ids(db_path, ids)
-            sources.append((name, entries))
+        task = progress.add_task("Spotify", total=len(sources))
 
-    task = progress.add_task("Spotify", total=len(sources))
+        if username:
+            csv_writer_cm = _PlaylistCsvWriter(username)
+        else:
+            csv_writer_cm = None
+            if sources:
+                logger.warning(
+                    "No username provided — skipping playlist CSV output"
+                )
 
-    playlist_records: list[dict[str, object]] = []
-    for name, entries in sources:
-        created = await create_spotify_playlist(client, user_id, name, entries)
-        playlist_records.extend(created)
-        progress.advance(task)
-
-    if username:
-        _write_playlist_csv(username, playlist_records)
-    elif playlist_records:
-        logger.warning(
-            "No username provided — skipping playlist CSV output (%d playlist(s) created)",
-            len(playlist_records),
-        )
+        if csv_writer_cm is not None:
+            with csv_writer_cm as csv_writer:
+                for name, entries in sources:
+                    created = await create_spotify_playlist(client, user_id, name, entries)
+                    csv_writer.write_records(created)
+                    progress.advance(task)
+        else:
+            for name, entries in sources:
+                await create_spotify_playlist(client, user_id, name, entries)
+                progress.advance(task)
+    finally:
+        await client.close()
