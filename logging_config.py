@@ -51,7 +51,12 @@ def _handle_asyncio_exception(loop, context: dict) -> None:
         logger.error(message)
 
 
-def setup_logging(level: int = logging.INFO, log_file: Path | None = None) -> None:
+def setup_logging(
+    console_level: int = logging.INFO,
+    file_level: int = logging.DEBUG,
+    root_level: int = logging.DEBUG,
+    log_file: Path | None = None,
+) -> None:
     """Configure logging with structured format for production.
 
     Args:
@@ -65,7 +70,7 @@ def setup_logging(level: int = logging.INFO, log_file: Path | None = None) -> No
         rich_tracebacks=True,
         show_time=True,
     )
-    console_handler.setLevel(level)
+    console_handler.setLevel(console_level)
 
     # Root logger setup
     root_logger = logging.getLogger()
@@ -73,7 +78,7 @@ def setup_logging(level: int = logging.INFO, log_file: Path | None = None) -> No
     # Prevent duplicate handlers on re-init
     root_logger.handlers.clear()
 
-    root_logger.setLevel(level)
+    root_logger.setLevel(root_level)
     root_logger.addHandler(console_handler)
 
     # File logging (structured, machine-readable)
@@ -84,7 +89,7 @@ def setup_logging(level: int = logging.INFO, log_file: Path | None = None) -> No
         )
 
         file_handler = logging.FileHandler(log_file, encoding="utf-8")
-        file_handler.setLevel(level)
+        file_handler.setLevel(file_level)
         file_handler.setFormatter(file_formatter)
 
         root_logger.addHandler(file_handler)
@@ -96,7 +101,6 @@ def setup_logging(level: int = logging.INFO, log_file: Path | None = None) -> No
     logging.getLogger("asyncio").setLevel(logging.WARNING)
     logging.getLogger("aiohttp").setLevel(logging.WARNING)
     logging.getLogger("urllib3").setLevel(logging.WARNING)
-    logging.getLogger("playwright").setLevel(logging.WARNING)
 
 
 def configure_asyncio_logging() -> None:

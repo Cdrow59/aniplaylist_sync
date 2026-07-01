@@ -47,10 +47,14 @@ def _make_argparser() -> argparse.ArgumentParser:
         help="Keep all AniPlaylist results instead of only exact anime-title matches",
     )
     parser.add_argument(
-        "--json", action="store_true", help="Write per-entry parsed results to debug/json/"
+        "--json",
+        action="store_true",
+        help="Write per-entry parsed results to debug/json/",
     )
     parser.add_argument(
-        "--raw", action="store_true", help="Write raw Algolia HTTP responses to debug/raw/"
+        "--raw",
+        action="store_true",
+        help="Write raw Algolia HTTP responses to debug/raw/",
     )
     parser.add_argument(
         "--confirm", action="store_true", help="Confirm running spotify"
@@ -79,11 +83,18 @@ def _make_argparser() -> argparse.ArgumentParser:
         help="Timeout in seconds for entire operation (default: 1800)",
     )
     parser.add_argument(
-        "--log-level",
+        "--console-level",
         type=str,
         default="INFO",
-        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
-        help="Logging level",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+        help="Console Logging level",
+    )
+    parser.add_argument(
+        "--file-level",
+        type=str,
+        default="DEBUG",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+        help="File Logging level",
     )
     parser.add_argument(
         "--anilist",
@@ -113,9 +124,11 @@ def main() -> None:
     log_dir = Path("debug/logs")
     log_dir.mkdir(parents=True, exist_ok=True)
 
-    log_level = getattr(logging, args.log_level, logging.INFO)
+    console_level = getattr(logging, args.console_level, logging.INFO)
+    file_level = getattr(logging, args.file_level, logging.DEBUG)
     setup_logging(
-        level=log_level,
+        console_level=console_level,
+        file_level=file_level,
         log_file=Path(f"debug/logs/aniplaylist_sync_{safe_timestamp}.log"),
     )
 

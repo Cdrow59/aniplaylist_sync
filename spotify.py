@@ -12,6 +12,7 @@ import os
 import re
 import time
 import urllib.parse
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -19,7 +20,6 @@ import aiohttp
 import aiosqlite
 from ratelimit import RateLimiter
 from rich.progress import Progress
-from http.server import BaseHTTPRequestHandler, HTTPServer
 
 logger = logging.getLogger(__name__)
 
@@ -361,7 +361,9 @@ def run_auth_flow(
     if not refresh_token:
         raise RuntimeError(f"No refresh_token in response: {data}")
 
-    logger.info("Spotify authorisation succeeded — SPOTIFY_REFRESH_TOKEN=%s", refresh_token)
+    logger.info(
+        "Spotify authorisation succeeded — SPOTIFY_REFRESH_TOKEN=%s", refresh_token
+    )
     return refresh_token
 
 
@@ -556,7 +558,9 @@ async def run_auth_flow_async(
     server = HTTPServer((host, port), _AuthCallbackHandler)
     server.auth_code = None
     server.auth_error = None
-    server.timeout = timeout  # makes handle_request() return after this many idle seconds
+    server.timeout = (
+        timeout  # makes handle_request() return after this many idle seconds
+    )
 
     params = urllib.parse.urlencode(
         {
@@ -852,9 +856,10 @@ async def create_spotify_playlist(
         for batch in _chunked(chunk, 100):
             await client.playlist_add_items(pid, batch)
 
+        label = f"[SPFY:{pid} '{playlist_name}']"
         logger.info(
             "Created playlist %s with %d tracks",
-            playlist_name,
+            label,
             len(chunk),
         )
 
