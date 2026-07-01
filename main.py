@@ -589,6 +589,21 @@ def create_progress() -> Progress:
     )
 
 
+def spotify_confirmed(args) -> bool:
+    """Ask the user to confirm running the Spotify stage, if --confirm was passed.
+
+    Must be called *before* any rich `Progress`/`Live` context is opened —
+    Confirm.ask's blocking input prompt gets visually swallowed by an
+    active Live redraw loop on the same console.
+    """
+    if not args.confirm:
+        return True
+    if not Confirm.ask("\nRun Spotify?", console=console):
+        logger.info("Spotify stage skipped — user declined")
+        return False
+    return True
+
+
 async def run_spotify_stage_if_needed(
     args,
     progress: Progress,
@@ -596,11 +611,6 @@ async def run_spotify_stage_if_needed(
     if args.dry_run:
         logger.info("Dry run — skipping Spotify stage")
         return
-
-    if args.confirm:
-        if not Confirm.ask("\nRun Spotify?", console=console):
-            logger.info("Spotify stage skipped — user declined")
-            return
 
     await run_spotify_stage(
         args.db,
@@ -612,6 +622,13 @@ async def run_spotify_stage_if_needed(
 
 async def run_cached_mode(args) -> None:
     logger.info("Cached mode — skipping MAL fetch and AniPlaylist scrape")
+
+    if args.dry_run:
+        logger.info("Dry run — skipping Spotify stage")
+        return
+
+    if not spotify_confirmed(args):
+        return
 
     with create_progress() as progress:
         await run_spotify_stage_if_needed(args, progress)
@@ -724,10 +741,8 @@ async def _run_impl(args) -> None:
         logger.info("Dry run — skipping Spotify stage")
         return
 
-    if args.confirm:
-        if not Confirm.ask("\nRun Spotify?", console=console):
-            logger.info("Spotify stage skipped — user declined")
-            return
+    if not spotify_confirmed(args):
+        return
 
     with create_progress() as progress:
         await run_spotify_stage(
