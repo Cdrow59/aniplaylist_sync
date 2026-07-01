@@ -606,6 +606,7 @@ async def run_spotify_stage_if_needed(
         args.db,
         megaplaylist=bool(args.megaplaylist),
         progress=progress,
+        username=args.username,
     )
 
 
@@ -733,4 +734,5 @@ async def _run_impl(args) -> None:
             args.db,
             megaplaylist=bool(args.megaplaylist),
             progress=progress,
+            username=args.username,
         )

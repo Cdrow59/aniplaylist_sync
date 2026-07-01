@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import csv
 import html
 import json
 import logging
@@ -325,11 +326,10 @@ def run_auth_flow(
     )
     auth_url = f"{_SPOTIFY_AUTH_URL}?{params}"
 
-    print("\n── Spotify Auth Flow ──────────────────────────────────────")
-    print("Open this URL in your browser and authorise the app:\n")
-    print(f"  {auth_url}\n")
-    print("After redirecting, paste the full redirect URL here:")
-    redirect_response = input("> ").strip()
+    logger.info("Spotify Auth Flow — open this URL and authorise the app: %s", auth_url)
+    redirect_response = input(
+        "After authorising, paste the full redirect URL here:\n> "
+    ).strip()
 
     # Extract the code from the redirected URL
     parsed = urllib.parse.urlparse(redirect_response)
@@ -361,8 +361,7 @@ def run_auth_flow(
     if not refresh_token:
         raise RuntimeError(f"No refresh_token in response: {data}")
 
-    print("\n── Success! Add this to your .env ─────────────────────────")
-    print(f"SPOTIFY_REFRESH_TOKEN={refresh_token}\n")
+    logger.info("Spotify authorisation succeeded — SPOTIFY_REFRESH_TOKEN=%s", refresh_token)
     return refresh_token
 
 
@@ -569,9 +568,7 @@ async def run_auth_flow_async(
     )
     auth_url = f"{_SPOTIFY_AUTH_URL}?{params}"
 
-    logger.warning("Opening browser for Spotify authorisation: %s", auth_url)
-    print("\nOpening your browser to authorise Spotify access...")
-    print(f"If it doesn't open automatically, visit:\n  {auth_url}\n")
+    logger.info("Opening browser for Spotify authorisation: %s", auth_url)
     webbrowser.open(auth_url, new=1, autoraise=False)
 
     loop = asyncio.get_event_loop()
@@ -815,7 +812,7 @@ async def create_spotify_playlist(
     user_id: str,
     name: str,
     entries: list[tuple[int, str, str, int | None]],
-) -> None:
+) -> list[dict[str, object]]:
 
     sorted_entries = sorted(
         entries,
@@ -834,10 +831,11 @@ async def create_spotify_playlist(
 
     if not uris:
         logger.warning("No tracks for %s", name)
-        return
+        return []
 
     chunks = list(_chunked(uris, SPOTIFY_PLAYLIST_LIMIT))
 
+    created: list[dict[str, object]] = []
     for idx, chunk in enumerate(chunks, start=1):
         playlist_name = name if len(chunks) == 1 else f"{name} (Part {idx})"
 
@@ -860,6 +858,23 @@ async def create_spotify_playlist(
             len(chunk),
         )
 
+        created.append({"id": pid, "name": playlist_name, "length": len(chunk)})
+
+    return created
+
+
+def _write_playlist_csv(username: str, records: list[dict[str, object]]) -> Path:
+    """Write playlist id/name/length rows to ``{username}_output.csv``."""
+    path = Path(f"{username}_output.csv")
+    with path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(["playlist_id", "name", "length"])
+        for r in records:
+            writer.writerow([r["id"], r["name"], r["length"]])
+
+    logger.info("Wrote %d playlist record(s) to %s", len(records), path)
+    return path
+
 
 # ---------------------------------------------------------------------------
 # MAIN STAGE
@@ -871,6 +886,7 @@ async def run_spotify_stage(
     *,
     megaplaylist: bool,
     progress: Progress,
+    username: str | None = None,
 ) -> None:
 
     client = await SpotifyClient.from_env_async()
@@ -907,6 +923,16 @@ async def run_spotify_stage(
 
     task = progress.add_task("Spotify", total=len(sources))
 
+    playlist_records: list[dict[str, object]] = []
     for name, entries in sources:
-        await create_spotify_playlist(client, user_id, name, entries)
+        created = await create_spotify_playlist(client, user_id, name, entries)
+        playlist_records.extend(created)
         progress.advance(task)
+
+    if username:
+        _write_playlist_csv(username, playlist_records)
+    elif playlist_records:
+        logger.warning(
+            "No username provided — skipping playlist CSV output (%d playlist(s) created)",
+            len(playlist_records),
+        )
