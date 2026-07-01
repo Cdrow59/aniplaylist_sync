@@ -82,6 +82,7 @@ _PUNCT_REPLACEMENTS: dict[str, str] = {
     "\uff1b": ";",
     "\uff0c": ",",
     "\uff0e": ".",
+    "\u3000": " ",
 }
 
 _SUFFIX_RE = re.compile(r"\s*\((tv|ona|ova|movie|special)\)\s*$", re.IGNORECASE)

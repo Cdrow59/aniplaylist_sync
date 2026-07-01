@@ -598,7 +598,7 @@ def spotify_confirmed(args) -> bool:
     """
     if not args.confirm:
         return True
-    if not Confirm.ask("\nRun Spotify?", console=console):
+    if not Confirm.ask("Run Spotify?", console=console):
         logger.info("Spotify stage skipped — user declined")
         return False
     return True
