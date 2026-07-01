@@ -617,6 +617,7 @@ async def run_spotify_stage_if_needed(
         megaplaylist=bool(args.megaplaylist),
         progress=progress,
         username=args.username,
+        spotify_user=getattr(args, "spotify_user", None),
     )
 
 
@@ -750,4 +751,5 @@ async def _run_impl(args) -> None:
             megaplaylist=bool(args.megaplaylist),
             progress=progress,
             username=args.username,
+            spotify_user=getattr(args, "spotify_user", None),
         )

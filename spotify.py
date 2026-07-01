@@ -27,6 +27,21 @@ logger = logging.getLogger(__name__)
 SPOTIFY_PLAYLIST_LIMIT = 9999
 
 
+def spotify_token_env_key(spotify_user: str | None = None) -> str:
+    """Return the ``.env`` key holding the refresh token for ``spotify_user``.
+
+    With no user given, this is the original single-account
+    ``SPOTIFY_REFRESH_TOKEN``. When ``--spotify-user NAME`` is passed on the
+    CLI, each account gets its own key (``SPOTIFY_REFRESH_TOKEN_NAME``), so
+    multiple Spotify accounts — each added as a user on the app in the
+    Spotify Developer Dashboard — can be authorised once and reused by name.
+    """
+    if not spotify_user:
+        return "SPOTIFY_REFRESH_TOKEN"
+    slug = re.sub(r"[^A-Za-z0-9]+", "_", spotify_user).strip("_").upper()
+    return f"SPOTIFY_REFRESH_TOKEN_{slug}"
+
+
 # ---------------------------------------------------------------------------
 # SPOTIFY CLIENT
 # ---------------------------------------------------------------------------
@@ -68,10 +83,12 @@ class SpotifyClient:
         client_id: str,
         client_secret: str,
         refresh_token: str,
+        token_env_key: str = "SPOTIFY_REFRESH_TOKEN",
     ) -> None:
         self._client_id = client_id
         self._client_secret = client_secret
         self._refresh_token = refresh_token
+        self._token_env_key = token_env_key
         self._access_token: str | None = None
         self._token_expiry: float = 0.0
         self._token_lock = asyncio.Lock()
@@ -84,44 +101,63 @@ class SpotifyClient:
     # ------------------------------------------------------------------
 
     @classmethod
-    def from_env(cls) -> "SpotifyClient":
+    def from_env(cls, spotify_user: str | None = None) -> "SpotifyClient":
         """Create a SpotifyClient from environment variables.
 
-        Reads ``SPOTIFY_CLIENT_ID``, ``SPOTIFY_CLIENT_SECRET``, and
-        ``SPOTIFY_REFRESH_TOKEN``.  Run :func:`run_auth_flow` once to obtain the refresh token.
+        Reads ``SPOTIFY_CLIENT_ID``, ``SPOTIFY_CLIENT_SECRET``, and the
+        refresh token. With no ``spotify_user``, the refresh token comes
+        from ``SPOTIFY_REFRESH_TOKEN``; pass ``spotify_user`` to instead use
+        that account's own ``SPOTIFY_REFRESH_TOKEN_<USER>`` key (see
+        :func:`spotify_token_env_key`), letting multiple Spotify accounts —
+        each added as a user on the app in the Spotify Developer Dashboard —
+        share one ``.env``.  Run :func:`run_auth_flow` once per account to
+        obtain its refresh token.
         """
+        token_env_key = spotify_token_env_key(spotify_user)
         return cls(
             client_id=os.getenv("SPOTIFY_CLIENT_ID"),
             client_secret=os.getenv("SPOTIFY_CLIENT_SECRET"),
-            refresh_token=os.getenv("SPOTIFY_REFRESH_TOKEN"),
+            refresh_token=os.getenv(token_env_key),
+            token_env_key=token_env_key,
         )
 
     @classmethod
-    async def from_env_async(cls) -> "SpotifyClient":
+    async def from_env_async(cls, spotify_user: str | None = None) -> "SpotifyClient":
         """Create a SpotifyClient from environment variables.
 
         Unlike :meth:`from_env`, this will automatically launch the
         browser-based authorisation flow (see :func:`run_auth_flow_async`)
-        if ``SPOTIFY_REFRESH_TOKEN`` is missing — no manual script run or
+        if the refresh token is missing — no manual script run or
         copy/pasting required.
+
+        ``spotify_user`` selects which account's refresh token to use/store,
+        via :func:`spotify_token_env_key`. This lets ``--spotify-user NAME``
+        run the sync against a different Spotify account than the default,
+        as long as that account has been added as a user on the app in the
+        Spotify Developer Dashboard (required while the app is in
+        Development Mode).
         """
         client_id = os.getenv("SPOTIFY_CLIENT_ID")
         client_secret = os.getenv("SPOTIFY_CLIENT_SECRET")
         redirect_uri = os.getenv("SPOTIFY_REDIRECT_URI")
-        refresh_token = os.getenv("SPOTIFY_REFRESH_TOKEN")
+        token_env_key = spotify_token_env_key(spotify_user)
+        refresh_token = os.getenv(token_env_key)
 
         if not refresh_token:
             logger.info(
-                "No SPOTIFY_REFRESH_TOKEN found — opening browser for Spotify authorisation"
+                "No %s found — opening browser for Spotify authorisation%s",
+                token_env_key,
+                f" (user: {spotify_user})" if spotify_user else "",
             )
             refresh_token = await run_auth_flow_async(
-                client_id, client_secret, redirect_uri
+                client_id, client_secret, redirect_uri, token_env_key=token_env_key
             )
 
         return cls(
             client_id=client_id,
             client_secret=client_secret,
             refresh_token=refresh_token,
+            token_env_key=token_env_key,
         )
 
     # ------------------------------------------------------------------
@@ -186,7 +222,8 @@ class SpotifyClient:
             if "refresh_token" in data:
                 self._refresh_token = data["refresh_token"]
                 logger.warning(
-                    "Spotify issued a new refresh token — update SPOTIFY_REFRESH_TOKEN in .env: %s",
+                    "Spotify issued a new refresh token — update %s in .env: %s",
+                    self._token_env_key,
                     data["refresh_token"],
                 )
 
@@ -502,24 +539,28 @@ class _AuthCallbackHandler(BaseHTTPRequestHandler):
         pass  # silence default request logging
 
 
-def _persist_refresh_token(refresh_token: str) -> None:
+def _persist_refresh_token(
+    refresh_token: str, token_env_key: str = "SPOTIFY_REFRESH_TOKEN"
+) -> None:
     """Write the new refresh token into .env so future runs skip the browser step."""
     try:
         from dotenv import set_key
 
         env_path = Path(__file__).with_name(".env")
         if env_path.exists():
-            set_key(str(env_path), "SPOTIFY_REFRESH_TOKEN", refresh_token)
-            logger.info("Saved SPOTIFY_REFRESH_TOKEN to %s", env_path)
+            set_key(str(env_path), token_env_key, refresh_token)
+            logger.info("Saved %s to %s", token_env_key, env_path)
         else:
             logger.warning(
                 "No .env file found next to spotify.py — add this manually: "
-                "SPOTIFY_REFRESH_TOKEN=%s",
+                "%s=%s",
+                token_env_key,
                 refresh_token,
             )
     except Exception:
         logger.warning(
-            "Could not auto-save SPOTIFY_REFRESH_TOKEN to .env — add manually: %s",
+            "Could not auto-save %s to .env — add manually: %s",
+            token_env_key,
             refresh_token,
         )
 
@@ -529,13 +570,23 @@ async def run_auth_flow_async(
     client_secret: str | None = None,
     redirect_uri: str | None = None,
     timeout: float = 180.0,
+    token_env_key: str = "SPOTIFY_REFRESH_TOKEN",
 ) -> str:
     """Fully automatic browser-based auth flow — no copy/pasting required.
 
     Spins up a one-shot local HTTP server on ``redirect_uri``, opens the
     Spotify authorisation page in the default browser, waits for the
     redirect to land, exchanges the code for tokens, and saves the new
-    ``SPOTIFY_REFRESH_TOKEN`` straight into ``.env``.
+    refresh token straight into ``.env`` under ``token_env_key`` (defaults
+    to ``SPOTIFY_REFRESH_TOKEN``; pass a per-user key from
+    :func:`spotify_token_env_key` to authorise a specific account).
+
+    The browser prompt authorises whichever Spotify account is currently
+    logged in on this machine — to authorise a *different* account, log
+    that account into open.spotify.com/Spotify first (or use a private
+    browser window), and make sure it has been added as a user on the app
+    in the Spotify Developer Dashboard, which is required while the app is
+    in Development Mode.
 
     ``redirect_uri`` must already be registered as a Redirect URI on the
     app in the Spotify Developer Dashboard.
@@ -616,7 +667,7 @@ async def run_auth_flow_async(
     if not refresh_token:
         raise RuntimeError(f"No refresh_token in token exchange response: {data}")
 
-    _persist_refresh_token(refresh_token)
+    _persist_refresh_token(refresh_token, token_env_key=token_env_key)
     logger.info("Spotify authorisation complete")
     return refresh_token
 
@@ -917,9 +968,18 @@ async def run_spotify_stage(
     megaplaylist: bool,
     progress: Progress,
     username: str | None = None,
+    spotify_user: str | None = None,
 ) -> None:
+    """Run the Spotify playlist-creation stage.
 
-    client = await SpotifyClient.from_env_async()
+    ``spotify_user`` selects which Spotify account to authorise/act as via
+    ``--spotify-user NAME`` on the CLI (see :func:`spotify_token_env_key`).
+    That account must be added as a user on the app in the Spotify
+    Developer Dashboard while the app is in Development Mode. Leave it
+    unset to keep using the single default account (``SPOTIFY_REFRESH_TOKEN``).
+    """
+
+    client = await SpotifyClient.from_env_async(spotify_user=spotify_user)
 
     try:
         try:
@@ -930,13 +990,14 @@ async def run_spotify_stage(
             msg = str(exc)
             if "Spotify token refresh failed" in msg or " 400" in msg or " 401" in msg:
                 logger.warning(
-                    "SPOTIFY_REFRESH_TOKEN appears invalid or expired — "
-                    "re-authorising in browser"
+                    "%s appears invalid or expired — re-authorising in browser",
+                    client._token_env_key,
                 )
                 new_refresh_token = await run_auth_flow_async(
                     client._client_id,
                     client._client_secret,
                     os.getenv("SPOTIFY_REDIRECT_URI"),
+                    token_env_key=client._token_env_key,
                 )
                 client._refresh_token = new_refresh_token
                 client._access_token = None

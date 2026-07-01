@@ -60,6 +60,19 @@ def _make_argparser() -> argparse.ArgumentParser:
         "--confirm", action="store_true", help="Confirm running spotify"
     )
     parser.add_argument(
+        "--spotify-user",
+        type=str,
+        default=None,
+        help=(
+            "Run Spotify actions as a different account than the default. "
+            "That account must already be added as a user on the app in "
+            "the Spotify Developer Dashboard (required while the app is "
+            "in Development Mode). Each --spotify-user gets its own saved "
+            "refresh token (SPOTIFY_REFRESH_TOKEN_<NAME> in .env), so "
+            "switching users doesn't require re-authorising every run."
+        ),
+    )
+    parser.add_argument(
         "--aniplaylist-delay",
         type=float,
         default=None,
