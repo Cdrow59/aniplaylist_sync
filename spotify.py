@@ -572,7 +572,7 @@ async def run_auth_flow_async(
     logger.warning("Opening browser for Spotify authorisation: %s", auth_url)
     print("\nOpening your browser to authorise Spotify access...")
     print(f"If it doesn't open automatically, visit:\n  {auth_url}\n")
-    webbrowser.open(auth_url)
+    webbrowser.open(auth_url, new=1, autoraise=False)
 
     loop = asyncio.get_event_loop()
     await loop.run_in_executor(None, server.handle_request)
