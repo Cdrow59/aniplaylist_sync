@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import html
 import json
 import logging
 import os
@@ -370,6 +371,112 @@ def run_auth_flow(
 # ---------------------------------------------------------------------------
 
 
+_SUCCESS_PAGE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Spotify connected</title>
+<style>
+  html, body {
+    height: 100%;
+    margin: 0;
+    background: #121212;
+    color: #ffffff;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .card {
+    text-align: center;
+    padding: 48px 40px;
+  }
+  .check {
+    width: 72px;
+    height: 72px;
+    margin: 0 auto 24px;
+    border-radius: 50%;
+    background: #1DB954;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .check svg { width: 36px; height: 36px; }
+  h1 { font-size: 22px; font-weight: 700; margin: 0 0 8px; }
+  p { font-size: 15px; color: #b3b3b3; margin: 0; }
+</style>
+</head>
+<body>
+  <div class="card">
+    <div class="check">
+      <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+        <path d="M5 13l4 4L19 7" stroke="#121212" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+      </svg>
+    </div>
+    <h1>Spotify connected</h1>
+    <p id="msg">This tab will close automatically&hellip;</p>
+  </div>
+  <script>
+    setTimeout(function () {
+      window.close();
+      setTimeout(function () {
+        document.getElementById('msg').textContent = 'You can close this tab now.';
+      }, 400);
+    }, 900);
+  </script>
+</body>
+</html>
+"""
+
+_ERROR_PAGE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Spotify authorisation failed</title>
+<style>
+  html, body {{
+    height: 100%;
+    margin: 0;
+    background: #121212;
+    color: #ffffff;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }}
+  .card {{ text-align: center; padding: 48px 40px; max-width: 420px; }}
+  .x {{
+    width: 72px;
+    height: 72px;
+    margin: 0 auto 24px;
+    border-radius: 50%;
+    background: #e91429;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }}
+  .x svg {{ width: 32px; height: 32px; }}
+  h1 {{ font-size: 22px; font-weight: 700; margin: 0 0 8px; }}
+  p {{ font-size: 15px; color: #b3b3b3; margin: 0; }}
+  code {{ color: #e0e0e0; }}
+</style>
+</head>
+<body>
+  <div class="card">
+    <div class="x">
+      <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+        <path d="M6 6l12 12M18 6L6 18" stroke="#121212" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>
+      </svg>
+    </div>
+    <h1>Authorisation failed</h1>
+    <p><code>{error}</code></p>
+    <p style="margin-top:12px;">You can close this tab and try again.</p>
+  </div>
+</body>
+</html>
+"""
+
+
 class _AuthCallbackHandler(BaseHTTPRequestHandler):
     """Tiny one-shot HTTP handler that captures the Spotify redirect."""
 
@@ -380,13 +487,14 @@ class _AuthCallbackHandler(BaseHTTPRequestHandler):
         self.server.auth_error = qs.get("error", [None])[0]
 
         self.send_response(200)
-        self.send_header("Content-Type", "text/html")
+        self.send_header("Content-Type", "text/html; charset=utf-8")
         self.end_headers()
         if self.server.auth_code:
-            body = "<html><body><h2>Spotify authorised \u2014 you can close this tab.</h2></body></html>"
+            body = _SUCCESS_PAGE
         else:
-            body = f"<html><body><h2>Spotify authorisation failed: {self.server.auth_error}</h2></body></html>"
-        self.wfile.write(body.encode())
+            safe_error = html.escape(self.server.auth_error or "unknown_error")
+            body = _ERROR_PAGE.format(error=safe_error)
+        self.wfile.write(body.encode("utf-8"))
 
     def log_message(self, format: str, *args: object) -> None:  # noqa: A002
         pass  # silence default request logging
