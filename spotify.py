@@ -880,8 +880,19 @@ async def create_spotify_playlist(
     )
 
     resolved: list[str] = []
-    for _mal_id, link, _type, _seq in sorted_entries:
-        resolved.extend(await resolve_spotify_link_to_track_uris(client, link))
+    total_entries = len(sorted_entries)
+    for idx, (mal_id, link, song_type, _seq) in enumerate(sorted_entries, start=1):
+        uris_for_entry = await resolve_spotify_link_to_track_uris(client, link)
+        resolved.extend(uris_for_entry)
+        logger.info(
+            "[%s] (%d/%d) mal_id=%s type=%s -> %d track(s) resolved",
+            name,
+            idx,
+            total_entries,
+            mal_id,
+            song_type or "?",
+            len(uris_for_entry),
+        )
 
     uris = _unique(resolved)
 
