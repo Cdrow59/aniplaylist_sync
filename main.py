@@ -725,7 +725,7 @@ async def _run_impl(args) -> None:
         return
 
     if args.confirm:
-        if not Confirm.ask("Run Spotify?", console=console):
+        if not Confirm.ask("\nRun Spotify?", console=console):
             logger.info("Spotify stage skipped — user declined")
             return
 

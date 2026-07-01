@@ -18,8 +18,9 @@ from typing import Any, Iterable
 
 import aiohttp
 import aiosqlite
-from ratelimit import RateLimiter
 from rich.progress import Progress
+
+from ratelimit import RateLimiter
 
 logger = logging.getLogger(__name__)
 
@@ -856,9 +857,9 @@ async def create_spotify_playlist(
         for batch in _chunked(chunk, 100):
             await client.playlist_add_items(pid, batch)
 
-        label = f"[SPFY:{pid} '{playlist_name}']"
+        label = f"[playlist:{pid} '{playlist_name}']"
         logger.info(
-            "Created playlist %s with %d tracks",
+            "Created %s with %d tracks",
             label,
             len(chunk),
         )
@@ -958,14 +959,14 @@ async def run_spotify_stage(
         else:
             csv_writer_cm = None
             if sources:
-                logger.warning(
-                    "No username provided — skipping playlist CSV output"
-                )
+                logger.warning("No username provided — skipping playlist CSV output")
 
         if csv_writer_cm is not None:
             with csv_writer_cm as csv_writer:
                 for name, entries in sources:
-                    created = await create_spotify_playlist(client, user_id, name, entries)
+                    created = await create_spotify_playlist(
+                        client, user_id, name, entries
+                    )
                     csv_writer.write_records(created)
                     progress.advance(task)
         else:
