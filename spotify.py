@@ -17,6 +17,7 @@ import aiohttp
 import aiosqlite
 from ratelimit import RateLimiter
 from rich.progress import Progress
+from http.server import BaseHTTPRequestHandler, HTTPServer
 
 logger = logging.getLogger(__name__)
 
@@ -90,6 +91,34 @@ class SpotifyClient:
             client_id=os.getenv("SPOTIFY_CLIENT_ID"),
             client_secret=os.getenv("SPOTIFY_CLIENT_SECRET"),
             refresh_token=os.getenv("SPOTIFY_REFRESH_TOKEN"),
+        )
+
+    @classmethod
+    async def from_env_async(cls) -> "SpotifyClient":
+        """Create a SpotifyClient from environment variables.
+
+        Unlike :meth:`from_env`, this will automatically launch the
+        browser-based authorisation flow (see :func:`run_auth_flow_async`)
+        if ``SPOTIFY_REFRESH_TOKEN`` is missing — no manual script run or
+        copy/pasting required.
+        """
+        client_id = os.getenv("SPOTIFY_CLIENT_ID")
+        client_secret = os.getenv("SPOTIFY_CLIENT_SECRET")
+        redirect_uri = os.getenv("SPOTIFY_REDIRECT_URI")
+        refresh_token = os.getenv("SPOTIFY_REFRESH_TOKEN")
+
+        if not refresh_token:
+            logger.info(
+                "No SPOTIFY_REFRESH_TOKEN found — opening browser for Spotify authorisation"
+            )
+            refresh_token = await run_auth_flow_async(
+                client_id, client_secret, redirect_uri
+            )
+
+        return cls(
+            client_id=client_id,
+            client_secret=client_secret,
+            refresh_token=refresh_token,
         )
 
     # ------------------------------------------------------------------
@@ -333,6 +362,152 @@ def run_auth_flow(
 
     print("\n── Success! Add this to your .env ─────────────────────────")
     print(f"SPOTIFY_REFRESH_TOKEN={refresh_token}\n")
+    return refresh_token
+
+
+# ---------------------------------------------------------------------------
+# FULLY AUTOMATIC BROWSER AUTH FLOW (no copy/paste required)
+# ---------------------------------------------------------------------------
+
+
+class _AuthCallbackHandler(BaseHTTPRequestHandler):
+    """Tiny one-shot HTTP handler that captures the Spotify redirect."""
+
+    def do_GET(self) -> None:  # noqa: N802 (stdlib naming)
+        parsed = urllib.parse.urlparse(self.path)
+        qs = urllib.parse.parse_qs(parsed.query)
+        self.server.auth_code = qs.get("code", [None])[0]
+        self.server.auth_error = qs.get("error", [None])[0]
+
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html")
+        self.end_headers()
+        if self.server.auth_code:
+            body = "<html><body><h2>Spotify authorised \u2014 you can close this tab.</h2></body></html>"
+        else:
+            body = f"<html><body><h2>Spotify authorisation failed: {self.server.auth_error}</h2></body></html>"
+        self.wfile.write(body.encode())
+
+    def log_message(self, format: str, *args: object) -> None:  # noqa: A002
+        pass  # silence default request logging
+
+
+def _persist_refresh_token(refresh_token: str) -> None:
+    """Write the new refresh token into .env so future runs skip the browser step."""
+    try:
+        from dotenv import set_key
+
+        env_path = Path(__file__).with_name(".env")
+        if env_path.exists():
+            set_key(str(env_path), "SPOTIFY_REFRESH_TOKEN", refresh_token)
+            logger.info("Saved SPOTIFY_REFRESH_TOKEN to %s", env_path)
+        else:
+            logger.warning(
+                "No .env file found next to spotify.py — add this manually: "
+                "SPOTIFY_REFRESH_TOKEN=%s",
+                refresh_token,
+            )
+    except Exception:
+        logger.warning(
+            "Could not auto-save SPOTIFY_REFRESH_TOKEN to .env — add manually: %s",
+            refresh_token,
+        )
+
+
+async def run_auth_flow_async(
+    client_id: str | None = None,
+    client_secret: str | None = None,
+    redirect_uri: str | None = None,
+    timeout: float = 180.0,
+) -> str:
+    """Fully automatic browser-based auth flow — no copy/pasting required.
+
+    Spins up a one-shot local HTTP server on ``redirect_uri``, opens the
+    Spotify authorisation page in the default browser, waits for the
+    redirect to land, exchanges the code for tokens, and saves the new
+    ``SPOTIFY_REFRESH_TOKEN`` straight into ``.env``.
+
+    ``redirect_uri`` must already be registered as a Redirect URI on the
+    app in the Spotify Developer Dashboard.
+    """
+    import webbrowser
+
+    client_id = client_id or os.getenv("SPOTIFY_CLIENT_ID")
+    client_secret = client_secret or os.getenv("SPOTIFY_CLIENT_SECRET")
+    redirect_uri = redirect_uri or os.getenv("SPOTIFY_REDIRECT_URI")
+
+    if not client_id or not client_secret or not redirect_uri:
+        raise RuntimeError(
+            "SPOTIFY_CLIENT_ID, SPOTIFY_CLIENT_SECRET, and SPOTIFY_REDIRECT_URI "
+            "must all be set (in .env or passed explicitly) to authorise."
+        )
+
+    parsed_redirect = urllib.parse.urlparse(redirect_uri)
+    host = parsed_redirect.hostname or "127.0.0.1"
+    port = parsed_redirect.port or 80
+
+    server = HTTPServer((host, port), _AuthCallbackHandler)
+    server.auth_code = None
+    server.auth_error = None
+    server.timeout = timeout  # makes handle_request() return after this many idle seconds
+
+    params = urllib.parse.urlencode(
+        {
+            "client_id": client_id,
+            "response_type": "code",
+            "redirect_uri": redirect_uri,
+            "scope": _SPOTIFY_SCOPE,
+        }
+    )
+    auth_url = f"{_SPOTIFY_AUTH_URL}?{params}"
+
+    logger.warning("Opening browser for Spotify authorisation: %s", auth_url)
+    print("\nOpening your browser to authorise Spotify access...")
+    print(f"If it doesn't open automatically, visit:\n  {auth_url}\n")
+    webbrowser.open(auth_url)
+
+    loop = asyncio.get_event_loop()
+    await loop.run_in_executor(None, server.handle_request)
+    server.server_close()
+
+    if server.auth_code is None and server.auth_error is None:
+        raise RuntimeError(
+            f"Timed out after {timeout:.0f}s waiting for Spotify authorisation in browser"
+        )
+
+    if server.auth_error:
+        raise RuntimeError(f"Spotify authorisation failed: {server.auth_error}")
+    if not server.auth_code:
+        raise RuntimeError("No authorisation code received from Spotify redirect")
+
+    credentials = base64.b64encode(f"{client_id}:{client_secret}".encode()).decode()
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            _SPOTIFY_TOKEN_URL,
+            headers={
+                "Authorization": f"Basic {credentials}",
+                "Content-Type": "application/x-www-form-urlencoded",
+            },
+            data={
+                "grant_type": "authorization_code",
+                "code": server.auth_code,
+                "redirect_uri": redirect_uri,
+            },
+            timeout=aiohttp.ClientTimeout(total=30),
+        ) as resp:
+            if resp.status >= 400:
+                text = await resp.text()
+                raise RuntimeError(
+                    f"Spotify token exchange failed ({resp.status}): {text[:200]}"
+                )
+            data = await resp.json()
+
+    refresh_token = data.get("refresh_token")
+    if not refresh_token:
+        raise RuntimeError(f"No refresh_token in token exchange response: {data}")
+
+    _persist_refresh_token(refresh_token)
+    logger.info("Spotify authorisation complete")
     return refresh_token
 
 
@@ -590,8 +765,29 @@ async def run_spotify_stage(
     progress: Progress,
 ) -> None:
 
-    client = SpotifyClient.from_env()
-    user_id = (await client.current_user())["id"]
+    client = await SpotifyClient.from_env_async()
+
+    try:
+        user_id = (await client.current_user())["id"]
+    except RuntimeError as exc:
+        # Stored refresh token is invalid/expired/revoked — re-authorise
+        # in the browser automatically rather than failing out.
+        msg = str(exc)
+        if "Spotify token refresh failed" in msg or " 400" in msg or " 401" in msg:
+            logger.warning(
+                "SPOTIFY_REFRESH_TOKEN appears invalid or expired — "
+                "re-authorising in browser"
+            )
+            new_refresh_token = await run_auth_flow_async(
+                client._client_id,
+                client._client_secret,
+                os.getenv("SPOTIFY_REDIRECT_URI"),
+            )
+            client._refresh_token = new_refresh_token
+            client._access_token = None
+            user_id = (await client.current_user())["id"]
+        else:
+            raise
 
     if megaplaylist:
         sources = [("AniPlaylist Megaplaylist", await fetch_result_links(db_path))]
