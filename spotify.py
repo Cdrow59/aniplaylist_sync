@@ -26,6 +26,49 @@ logger = logging.getLogger(__name__)
 
 SPOTIFY_PLAYLIST_LIMIT = 9999
 
+# ---------------------------------------------------------------------------
+# SPOTIFY CLIENT
+# ---------------------------------------------------------------------------
+
+_SPOTIFY_BASE = "https://api.spotify.com/v1"
+_SPOTIFY_TOKEN_URL = "https://accounts.spotify.com/api/token"
+_SPOTIFY_AUTH_URL = "https://accounts.spotify.com/authorize"
+_SPOTIFY_SCOPE = "playlist-modify-private playlist-modify-public"
+
+
+# ---------------------------------------------------------------------------
+# SONG TYPE FILTERING
+# ---------------------------------------------------------------------------
+
+# Song types to include by default (case-insensitive). Applies to every
+# playlist unless overridden below in SERIES_SONG_TYPE_FILTER. Set to
+# ``None`` to disable filtering entirely (include every song type,
+# including entries with a missing/blank song_type).
+DEFAULT_SONG_TYPE_FILTER: set[str] | None = {"op", "ed"}
+
+# Per-series overrides, keyed by the exact series name as it appears in the
+# `series` table / playlist name (or "AniPlaylist Megaplaylist" for the
+# megaplaylist run). A series not listed here falls back to
+# DEFAULT_SONG_TYPE_FILTER. Set a series's value to ``None`` to disable
+# filtering for just that series (include all song types for it).
+#
+# These overrides are applied PER ENTRY based on each track's own series —
+# they work the same whether you're building individual per-series
+# playlists or one combined megaplaylist (see ``series_lookup`` in
+# :func:`create_spotify_playlist`).
+#
+# Example:
+#   SERIES_SONG_TYPE_FILTER = {
+#       "Attack on Titan": {"op", "ed"},   # no OSTs for this one
+#       "Cowboy Bebop": None,              # include everything
+#   }
+SERIES_SONG_TYPE_FILTER: dict[str, set[str] | None] = {
+    "Naruto": None,
+    "One Piece": None,
+    "Bleach": None,
+    "Fairy Tail": None,
+}
+
 
 def spotify_token_env_key(spotify_user: str | None = None) -> str:
     """Return the ``.env`` key holding the refresh token for ``spotify_user``.
@@ -40,16 +83,6 @@ def spotify_token_env_key(spotify_user: str | None = None) -> str:
         return "SPOTIFY_REFRESH_TOKEN"
     slug = re.sub(r"[^A-Za-z0-9]+", "_", spotify_user).strip("_").upper()
     return f"SPOTIFY_REFRESH_TOKEN_{slug}"
-
-
-# ---------------------------------------------------------------------------
-# SPOTIFY CLIENT
-# ---------------------------------------------------------------------------
-
-_SPOTIFY_BASE = "https://api.spotify.com/v1"
-_SPOTIFY_TOKEN_URL = "https://accounts.spotify.com/api/token"
-_SPOTIFY_AUTH_URL = "https://accounts.spotify.com/authorize"
-_SPOTIFY_SCOPE = "playlist-modify-private playlist-modify-public"
 
 
 class SpotifyClient:
@@ -552,8 +585,7 @@ def _persist_refresh_token(
             logger.info("Saved %s to %s", token_env_key, env_path)
         else:
             logger.warning(
-                "No .env file found next to spotify.py — add this manually: "
-                "%s=%s",
+                "No .env file found next to spotify.py — add this manually: " "%s=%s",
                 token_env_key,
                 refresh_token,
             )
@@ -742,6 +774,27 @@ def _safe_seq(seq: int | None) -> int:
     return seq if seq is not None else 10**9
 
 
+def _allowed_song_types(series_name: str | None) -> set[str] | None:
+    """Resolve the allowed song types for a given series name.
+
+    Returns a lowercase set of allowed song types, or ``None`` if all types
+    are allowed (no filtering).
+    """
+    if series_name is not None and series_name in SERIES_SONG_TYPE_FILTER:
+        allowed = SERIES_SONG_TYPE_FILTER[series_name]
+    else:
+        allowed = DEFAULT_SONG_TYPE_FILTER
+    return {t.lower() for t in allowed} if allowed is not None else None
+
+
+def _entry_passes_song_type_filter(
+    song_type: str | None, allowed: set[str] | None
+) -> bool:
+    if allowed is None:
+        return True
+    return (song_type or "").lower() in allowed
+
+
 # ---------------------------------------------------------------------------
 # DB FETCH
 # ---------------------------------------------------------------------------
@@ -822,6 +875,20 @@ async def fetch_series_playlist_sources(db_path: Path):
     return out
 
 
+async def fetch_mal_id_to_series(db_path: Path) -> dict[int, str]:
+    """Map each ``mal_id`` to its series name.
+
+    Used in megaplaylist mode so per-series ``SERIES_SONG_TYPE_FILTER``
+    overrides can still be applied per-entry, even though all entries are
+    combined into a single playlist with no series-specific ``name``.
+    """
+    mapping: dict[int, str] = {}
+    for name, ids in await fetch_series_playlist_sources(db_path):
+        for mal_id in ids:
+            mapping[mal_id] = name
+    return mapping
+
+
 # ---------------------------------------------------------------------------
 # SPOTIFY RESOLUTION
 # ---------------------------------------------------------------------------
@@ -868,10 +935,39 @@ async def create_spotify_playlist(
     user_id: str,
     name: str,
     entries: list[tuple[int, str, str, int | None]],
+    series_lookup: dict[int, str] | None = None,
 ) -> list[dict[str, object]]:
+    """Create (one or more) Spotify playlists from ``entries``.
+
+    ``series_lookup`` maps ``mal_id -> series_name`` and, when provided, is
+    used to resolve the song-type filter *per entry* via that entry's own
+    series — this is what makes ``SERIES_SONG_TYPE_FILTER`` overrides work
+    correctly in megaplaylist mode, where ``name`` is a fixed label
+    ("AniPlaylist Megaplaylist") rather than an actual series name. When
+    ``series_lookup`` is ``None`` (per-series mode), the filter falls back
+    to resolving against ``name`` directly, same as before.
+    """
+
+    def _entry_allowed(mal_id: int, song_type: str | None) -> bool:
+        if series_lookup is not None:
+            series_name = series_lookup.get(mal_id, name)
+        else:
+            series_name = name
+        allowed_types = _allowed_song_types(series_name)
+        return _entry_passes_song_type_filter(song_type, allowed_types)
+
+    filtered_entries = [e for e in entries if _entry_allowed(e[0], e[2])]
+
+    if len(filtered_entries) != len(entries):
+        logger.info(
+            "[%s] song-type filter: %d/%d entries kept",
+            name,
+            len(filtered_entries),
+            len(entries),
+        )
 
     sorted_entries = sorted(
-        entries,
+        filtered_entries,
         key=lambda x: (
             x[0],
             _media_priority(x[2]),
@@ -1016,9 +1112,15 @@ async def run_spotify_stage(
             else:
                 raise
 
+        # series_lookup (mal_id -> series name) lets per-entry filtering
+        # apply SERIES_SONG_TYPE_FILTER overrides correctly in megaplaylist
+        # mode, where sources is a single combined batch with no per-entry
+        # series name otherwise available.
         if megaplaylist:
+            series_lookup = await fetch_mal_id_to_series(db_path)
             sources = [("AniPlaylist Megaplaylist", await fetch_result_links(db_path))]
         else:
+            series_lookup = None
             sources = []
             for name, ids in await fetch_series_playlist_sources(db_path):
                 entries = await fetch_playlist_links_for_mal_ids(db_path, ids)
@@ -1037,13 +1139,15 @@ async def run_spotify_stage(
             with csv_writer_cm as csv_writer:
                 for name, entries in sources:
                     created = await create_spotify_playlist(
-                        client, user_id, name, entries
+                        client, user_id, name, entries, series_lookup=series_lookup
                     )
                     csv_writer.write_records(created)
                     progress.advance(task)
         else:
             for name, entries in sources:
-                await create_spotify_playlist(client, user_id, name, entries)
+                await create_spotify_playlist(
+                    client, user_id, name, entries, series_lookup=series_lookup
+                )
                 progress.advance(task)
     finally:
         await client.close()
