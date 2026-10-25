@@ -15,7 +15,7 @@ DEFAULTS = {
     "MAL": {"per_second": 1.0, "burst": 0, "jitter_min": 0.0, "jitter_max": 0.0},
     "AniList": {"per_second": 1.0, "burst": 0, "jitter_min": 0.0, "jitter_max": 0.0},
     "Spotify": {"per_second": 2.0, "burst": 0, "jitter_min": 0.0, "jitter_max": 0.0},
-    "Algolia": {"per_second": 0.25, "burst": 0, "jitter_min": 0.1, "jitter_max": 1.0},
+    "Algolia": {"per_second": 0.5, "burst": 0, "jitter_min": 0.1, "jitter_max": 1.0},
 }
 
 

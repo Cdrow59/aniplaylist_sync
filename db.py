@@ -94,8 +94,106 @@ async def init_db(db_path: Path) -> None:
             )
         """)
 
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS playlists (
+                id            TEXT PRIMARY KEY,
+                playlist_name TEXT NOT NULL,
+                series_id     INTEGER REFERENCES series(id) ON DELETE SET NULL
+            )
+        """)
+
         await db.commit()
         logger.info("Database initialized at %s", db_path)
+
+
+async def fetch_playlists(
+    db_path: Path, series_id: int | None, playlist_name: str | None = None
+) -> list[dict[str, object]]:
+    async with aiosqlite.connect(db_path) as db:
+        if series_id is None:
+            query = """
+                SELECT id, playlist_name, series_id
+                FROM playlists
+                WHERE series_id IS NULL
+                ORDER BY playlist_name
+            """
+            params = ()
+        elif playlist_name is None:
+            query = """
+                SELECT id, playlist_name, series_id
+                FROM playlists
+                WHERE series_id = ?
+                ORDER BY playlist_name
+            """
+            params = (series_id,)
+        else:
+            query = """
+                SELECT id, playlist_name, series_id
+                FROM playlists
+                     WHERE series_id = ?
+                         OR playlist_name = ?
+                         OR playlist_name LIKE ?
+                ORDER BY playlist_name
+            """
+            params = (series_id, playlist_name, f"{playlist_name} (Part %")
+        async with db.execute(query, params) as cursor:
+            rows = await cursor.fetchall()
+
+    return [
+        {"id": playlist_id, "name": playlist_name, "series_id": stored_series_id}
+        for playlist_id, playlist_name, stored_series_id in rows
+    ]
+
+
+async def save_playlists(
+    db_path: Path,
+    records: Iterable[dict[str, object]],
+    series_id: int | None,
+) -> None:
+    rows = [(str(record["id"]), str(record["name"]), series_id) for record in records]
+    if not rows:
+        return
+
+    async with aiosqlite.connect(db_path) as db:
+        await db.executemany(
+            """
+            INSERT INTO playlists(id, playlist_name, series_id)
+            VALUES (?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                playlist_name = excluded.playlist_name,
+                series_id = excluded.series_id
+            """,
+            rows,
+        )
+        await db.commit()
+
+
+async def delete_playlists(db_path: Path, playlist_ids: Iterable[str]) -> None:
+    ids = list(playlist_ids)
+    if not ids:
+        return
+    placeholders = ",".join("?" for _ in ids)
+    async with aiosqlite.connect(db_path) as db:
+        await db.execute(f"DELETE FROM playlists WHERE id IN ({placeholders})", ids)
+        await db.commit()
+
+
+async def delete_all_playlists(db_path: Path) -> None:
+    async with aiosqlite.connect(db_path) as db:
+        await db.execute("DELETE FROM playlists")
+        await db.commit()
+
+
+async def fetch_all_playlists(db_path: Path) -> list[dict[str, object]]:
+    async with aiosqlite.connect(db_path) as db:
+        async with db.execute(
+            "SELECT id, playlist_name, series_id FROM playlists ORDER BY playlist_name"
+        ) as cursor:
+            rows = await cursor.fetchall()
+    return [
+        {"id": playlist_id, "name": playlist_name, "series_id": series_id}
+        for playlist_id, playlist_name, series_id in rows
+    ]
 
 
 # ---------------------------------------------------------------------------

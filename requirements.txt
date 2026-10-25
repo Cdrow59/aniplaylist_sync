@@ -1,5 +1,6 @@
 aiosqlite
 aiohttp
+certifi
 networkx
 python-dotenv
 rich

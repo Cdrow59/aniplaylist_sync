@@ -4,12 +4,12 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import csv
 import html
 import json
 import logging
 import os
 import re
+import ssl
 import time
 import urllib.parse
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -18,13 +18,22 @@ from typing import Any, Iterable
 
 import aiohttp
 import aiosqlite
+import certifi
 from rich.progress import Progress
 
+from db import (
+    delete_all_playlists,
+    delete_playlists,
+    fetch_all_playlists,
+    fetch_playlists,
+    save_playlists,
+)
 from ratelimit import RateLimiter
 
 logger = logging.getLogger(__name__)
 
 SPOTIFY_PLAYLIST_LIMIT = 9999
+SPOTIFY_TRACK_BATCH_LIMIT = 100
 
 # ---------------------------------------------------------------------------
 # SPOTIFY CLIENT
@@ -44,7 +53,7 @@ _SPOTIFY_SCOPE = "playlist-modify-private playlist-modify-public"
 # playlist unless overridden below in SERIES_SONG_TYPE_FILTER. Set to
 # ``None`` to disable filtering entirely (include every song type,
 # including entries with a missing/blank song_type).
-DEFAULT_SONG_TYPE_FILTER: set[str] | None = {"op", "ed"}
+DEFAULT_SONG_TYPE_FILTER: set[str] | None = None
 
 # Per-series overrides, keyed by the exact series name as it appears in the
 # `series` table / playlist name (or "AniPlaylist Megaplaylist" for the
@@ -62,12 +71,7 @@ DEFAULT_SONG_TYPE_FILTER: set[str] | None = {"op", "ed"}
 #       "Attack on Titan": {"op", "ed"},   # no OSTs for this one
 #       "Cowboy Bebop": None,              # include everything
 #   }
-SERIES_SONG_TYPE_FILTER: dict[str, set[str] | None] = {
-    "Naruto": None,
-    "One Piece": None,
-    "Bleach": None,
-    "Fairy Tail": None,
-}
+SERIES_SONG_TYPE_FILTER: dict[str, set[str] | None] = {}
 
 
 def spotify_token_env_key(spotify_user: str | None = None) -> str:
@@ -199,7 +203,10 @@ class SpotifyClient:
 
     def _get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession()
+            ca_bundle = os.getenv("SPOTIFY_CA_BUNDLE") or certifi.where()
+            ssl_context = ssl.create_default_context(cafile=ca_bundle)
+            connector = aiohttp.TCPConnector(ssl=ssl_context)
+            self._session = aiohttp.ClientSession(connector=connector)
         return self._session
 
     async def close(self) -> None:
@@ -292,7 +299,7 @@ class SpotifyClient:
                 timeout=aiohttp.ClientTimeout(total=30),
             ) as resp:
                 # 204 No Content — success with no body (e.g. playlist_add_items)
-                if resp.status == 204:
+                if resp.status == 204 or resp.content_length == 0:
                     return None
 
                 if resp.status == 401:
@@ -350,11 +357,32 @@ class SpotifyClient:
     async def current_user(self) -> dict:
         return await self._request("GET", "me")
 
+    async def user_playlists(self, limit: int = 50, offset: int = 0) -> dict:
+        return await self._request(
+            "GET",
+            "me/playlists",
+            params={"limit": limit, "offset": offset},
+        )
+
     async def post_playlist(self, payload: dict) -> dict:
         return await self._request("POST", "me/playlists", json_body=payload)
 
     async def playlist_add_items(self, pid: str, uris: list[str]) -> None:
         await self._request("POST", f"playlists/{pid}/tracks", json_body={"uris": uris})
+
+    async def playlist_replace_items(self, pid: str, uris: list[str]) -> None:
+        await self._request(
+            "PUT",
+            f"playlists/{pid}/items",
+            json_body={"uris": uris[:SPOTIFY_TRACK_BATCH_LIMIT]},
+        )
+        for batch in _chunked(
+            uris[SPOTIFY_TRACK_BATCH_LIMIT:], SPOTIFY_TRACK_BATCH_LIMIT
+        ):
+            await self.playlist_add_items(pid, batch)
+
+    async def playlist_unfollow(self, pid: str) -> None:
+        await self._request("DELETE", f"playlists/{pid}/followers")
 
     async def album_tracks(self, rid: str, limit: int, offset: int) -> dict:
         return await self._request(
@@ -858,20 +886,20 @@ async def fetch_playlist_links_for_mal_ids(
 async def fetch_series_playlist_sources(db_path: Path):
     async with aiosqlite.connect(db_path) as db:
         async with db.execute("""
-            SELECT series_name, member_ids_json
+            SELECT id, series_name, member_ids_json
             FROM series
             ORDER BY series_name COLLATE NOCASE
         """) as cursor:
             rows = await cursor.fetchall()
 
     out = []
-    for name, json_ids in rows:
+    for series_id, name, json_ids in rows:
         try:
             ids = [int(x) for x in json.loads(json_ids)]
         except Exception:
             continue
         if name and ids:
-            out.append((name.strip(), ids))
+            out.append((int(series_id), name.strip(), ids))
     return out
 
 
@@ -883,7 +911,7 @@ async def fetch_mal_id_to_series(db_path: Path) -> dict[int, str]:
     combined into a single playlist with no series-specific ``name``.
     """
     mapping: dict[int, str] = {}
-    for name, ids in await fetch_series_playlist_sources(db_path):
+    for _series_id, name, ids in await fetch_series_playlist_sources(db_path):
         for mal_id in ids:
             mapping[mal_id] = name
     return mapping
@@ -936,6 +964,8 @@ async def create_spotify_playlist(
     name: str,
     entries: list[tuple[int, str, str, int | None]],
     series_lookup: dict[int, str] | None = None,
+    existing_playlists: list[dict[str, object]] | None = None,
+    overwrite: bool = False,
 ) -> list[dict[str, object]]:
     """Create (one or more) Spotify playlists from ``entries``.
 
@@ -998,26 +1028,40 @@ async def create_spotify_playlist(
 
     chunks = list(_chunked(uris, SPOTIFY_PLAYLIST_LIMIT))
 
+    existing_playlists = existing_playlists or []
     created: list[dict[str, object]] = []
     for idx, chunk in enumerate(chunks, start=1):
         playlist_name = name if len(chunks) == 1 else f"{name} (Part {idx})"
 
-        playlist = await client.post_playlist(
-            {
-                "name": playlist_name,
-                "public": True,
-                "description": "Created by aniplaylist_sync",
-            }
+        existing = next(
+            (
+                record
+                for record in existing_playlists
+                if record["name"] == playlist_name
+            ),
+            None,
         )
-
-        pid = playlist["id"]
-
-        for batch in _chunked(chunk, 100):
-            await client.playlist_add_items(pid, batch)
+        if existing is not None and overwrite:
+            pid = str(existing["id"])
+            await client.playlist_replace_items(pid, chunk)
+            action = "Updated"
+        else:
+            playlist = await client.post_playlist(
+                {
+                    "name": playlist_name,
+                    "public": True,
+                    "description": "Created by aniplaylist_sync",
+                }
+            )
+            pid = playlist["id"]
+            for batch in _chunked(chunk, SPOTIFY_TRACK_BATCH_LIMIT):
+                await client.playlist_add_items(pid, batch)
+            action = "Created"
 
         label = f"[playlist:{pid} '{playlist_name}']"
         logger.info(
-            "Created %s with %d tracks",
+            "%s %s with %d tracks",
+            action,
             label,
             len(chunk),
         )
@@ -1025,43 +1069,6 @@ async def create_spotify_playlist(
         created.append({"id": pid, "name": playlist_name, "length": len(chunk)})
 
     return created
-
-
-_PLAYLIST_CSV_HEADER = ["playlist_id", "name", "length"]
-
-
-class _PlaylistCsvWriter:
-    """Writes playlist id/name/length rows incrementally to
-    ``output/output_{username}.csv`` as each playlist is created, so
-    progress isn't lost if a run is interrupted partway through.
-    """
-
-    def __init__(self, username: str) -> None:
-        self.path = Path("output") / f"output_{username}.csv"
-        self._file = None
-        self._writer = None
-        self.count = 0
-
-    def __enter__(self) -> "_PlaylistCsvWriter":
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._file = self.path.open("w", newline="", encoding="utf-8")
-        self._writer = csv.writer(self._file)
-        self._writer.writerow(_PLAYLIST_CSV_HEADER)
-        self._file.flush()
-        return self
-
-    def write_records(self, records: list[dict[str, object]]) -> None:
-        if not records or self._writer is None:
-            return
-        for r in records:
-            self._writer.writerow([r["id"], r["name"], r["length"]])
-        self._file.flush()
-        self.count += len(records)
-
-    def __exit__(self, *_: object) -> None:
-        if self._file is not None:
-            self._file.close()
-        logger.info("Wrote %d playlist record(s) to %s", self.count, self.path)
 
 
 # ---------------------------------------------------------------------------
@@ -1076,6 +1083,8 @@ async def run_spotify_stage(
     progress: Progress,
     username: str | None = None,
     spotify_user: str | None = None,
+    overwrite_playlists: bool = False,
+    rebuild_playlists: bool = False,
 ) -> None:
     """Run the Spotify playlist-creation stage.
 
@@ -1116,38 +1125,87 @@ async def run_spotify_stage(
         # apply SERIES_SONG_TYPE_FILTER overrides correctly in megaplaylist
         # mode, where sources is a single combined batch with no per-entry
         # series name otherwise available.
+        if rebuild_playlists:
+            tracked = await fetch_all_playlists(db_path)
+            for record in tracked:
+                try:
+                    await client.playlist_unfollow(str(record["id"]))
+                except RuntimeError as exc:
+                    logger.warning(
+                        "Could not delete Spotify playlist %s: %s", record["id"], exc
+                    )
+            await delete_all_playlists(db_path)
+            logger.info("Deleted %d tracked Spotify playlist(s)", len(tracked))
+
+        discovered_playlists: list[dict[str, object]] = []
+        offset = 0
+        while True:
+            page = await client.user_playlists(offset=offset)
+            for playlist in page.get("items", []):
+                owner = playlist.get("owner") or {}
+                if (
+                    owner.get("id") == user_id
+                    and playlist.get("id")
+                    and playlist.get("name")
+                ):
+                    discovered_playlists.append(
+                        {"id": playlist["id"], "name": playlist["name"]}
+                    )
+            if not page.get("next"):
+                break
+            offset += int(page.get("limit", 50))
+
         if megaplaylist:
             series_lookup = await fetch_mal_id_to_series(db_path)
-            sources = [("AniPlaylist Megaplaylist", await fetch_result_links(db_path))]
+            sources = [
+                (None, "AniPlaylist Megaplaylist", await fetch_result_links(db_path))
+            ]
         else:
             series_lookup = None
             sources = []
-            for name, ids in await fetch_series_playlist_sources(db_path):
+            for series_id, name, ids in await fetch_series_playlist_sources(db_path):
                 entries = await fetch_playlist_links_for_mal_ids(db_path, ids)
-                sources.append((name, entries))
+                sources.append((series_id, name, entries))
 
         task = progress.add_task("Spotify", total=len(sources))
 
-        if username:
-            csv_writer_cm = _PlaylistCsvWriter(username)
-        else:
-            csv_writer_cm = None
-            if sources:
-                logger.warning("No username provided — skipping playlist CSV output")
-
-        if csv_writer_cm is not None:
-            with csv_writer_cm as csv_writer:
-                for name, entries in sources:
-                    created = await create_spotify_playlist(
-                        client, user_id, name, entries, series_lookup=series_lookup
-                    )
-                    csv_writer.write_records(created)
-                    progress.advance(task)
-        else:
-            for name, entries in sources:
-                await create_spotify_playlist(
-                    client, user_id, name, entries, series_lookup=series_lookup
+        for series_id, name, entries in sources:
+            existing = await fetch_playlists(db_path, series_id, name)
+            known_ids = {str(record["id"]) for record in existing}
+            existing.extend(
+                record
+                for record in discovered_playlists
+                if str(record["id"]) not in known_ids
+                and (
+                    record["name"] == name
+                    or str(record["name"]).startswith(f"{name} (Part ")
                 )
+            )
+            if existing and not overwrite_playlists:
+                logger.info("Skipping existing playlist(s) for %s", name)
+                await save_playlists(db_path, existing, series_id)
                 progress.advance(task)
+                continue
+
+            records = await create_spotify_playlist(
+                client,
+                user_id,
+                name,
+                entries,
+                series_lookup=series_lookup,
+                existing_playlists=existing,
+                overwrite=overwrite_playlists,
+            )
+            if records:
+                stale_ids = {
+                    str(record["id"])
+                    for record in existing
+                    if record["id"] not in {item["id"] for item in records}
+                }
+                for playlist_id in stale_ids:
+                    await client.playlist_unfollow(playlist_id)
+                await delete_playlists(db_path, stale_ids)
+                await save_playlists(db_path, records, series_id)
+            progress.advance(task)
     finally:
         await client.close()

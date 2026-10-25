@@ -13,7 +13,6 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-from db import DB_PATH
 from logging_config import setup_logging
 
 load_dotenv(dotenv_path=Path(__file__).with_name(".env"), override=True)
@@ -40,6 +39,16 @@ def _make_argparser() -> argparse.ArgumentParser:
         "--megaplaylist",
         action="store_true",
         help="Put all results into one Spotify playlist instead of one playlist per series",
+    )
+    parser.add_argument(
+        "--overwrite-playlists",
+        action="store_true",
+        help="Clear and replace existing Spotify playlists instead of skipping them",
+    )
+    parser.add_argument(
+        "--rebuild-playlists",
+        action="store_true",
+        help="Delete all tracked Spotify playlists and recreate them",
     )
     parser.add_argument(
         "--no-exact-filter",

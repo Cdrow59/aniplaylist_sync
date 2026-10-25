@@ -618,6 +618,8 @@ async def run_spotify_stage_if_needed(
         progress=progress,
         username=args.username,
         spotify_user=getattr(args, "spotify_user", None),
+        overwrite_playlists=bool(getattr(args, "overwrite_playlists", False)),
+        rebuild_playlists=bool(getattr(args, "rebuild_playlists", False)),
     )
 
 
@@ -752,4 +754,6 @@ async def _run_impl(args) -> None:
             progress=progress,
             username=args.username,
             spotify_user=getattr(args, "spotify_user", None),
+            overwrite_playlists=bool(getattr(args, "overwrite_playlists", False)),
+            rebuild_playlists=bool(getattr(args, "rebuild_playlists", False)),
         )
